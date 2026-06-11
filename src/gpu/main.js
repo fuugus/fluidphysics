@@ -225,8 +225,9 @@ async function init() {
     grabDepth = hit.t;
     const p = ro.clone().addScaledVector(rd, hit.t);
     lastGrabPoint = p.clone();
-    sim.grabAt([p.x, p.y, p.z], 0.45);
-    recAction({ grab: [p.x, p.y, p.z, 0.45] });
+    const lattice = hit.id < sim.N1 ? 0 : 1;
+    sim.grabAt([p.x, p.y, p.z], 0.45, lattice);
+    recAction({ grab: [p.x, p.y, p.z, 0.45, lattice] });
     canvas.style.cursor = 'grabbing';
   }
 
@@ -341,7 +342,7 @@ async function init() {
     const r = replaying;
     while (r.idx < r.actions.length && r.actions[r.idx].f <= r.frame) {
       const a = r.actions[r.idx++];
-      if (a.grab) sim.grabAt(a.grab.slice(0, 3), a.grab[3]);
+      if (a.grab) sim.grabAt(a.grab.slice(0, 3), a.grab[3], a.grab[4] ?? 0xffff);
       if (a.rel) sim.release();
       if (a.cut) sim.queueCut(a.cut[0], a.cut[1], a.cut[2]);
       if (a.gd) sim.pending.grabDelta = [...a.gd];
@@ -368,6 +369,10 @@ async function init() {
   });
   addEventListener('keyup', async (e) => {
     if (e.code !== 'Space') return;
+    // a quick tap can release before the frame loop starts the recording —
+    // wait briefly so a tap still produces a scene file
+    for (let w = 0; w < 10 && !recording && recordingPending; w++)
+      await new Promise((r) => setTimeout(r, 30));
     recordingPending = false;
     if (!recording) return;
     const rec = recording;
@@ -386,6 +391,49 @@ async function init() {
   $('drain').addEventListener('click', () => sim.clearFluid());
   canvas.style.cursor = 'crosshair';
   addEventListener('resize', updateCamera);
+
+  // ---- toast + drag & drop loader for snapshots/recordings ----
+  function toast(msg, ms = 2500) {
+    let el = $('toast');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'toast';
+      el.style.cssText = 'position:fixed;top:16px;left:50%;transform:translateX(-50%);' +
+        'background:rgba(16,20,28,.85);color:#dfe6f0;padding:8px 18px;border-radius:10px;' +
+        'font:13px system-ui;z-index:10;pointer-events:none;border:1px solid rgba(255,255,255,.1)';
+      document.body.appendChild(el);
+    }
+    el.textContent = msg;
+    el.style.display = 'block';
+    clearTimeout(el._t);
+    el._t = setTimeout(() => { el.style.display = 'none'; }, ms);
+  }
+
+  addEventListener('dragover', (e) => e.preventDefault());
+  addEventListener('drop', async (e) => {
+    e.preventDefault();
+    const file = e.dataTransfer.files[0];
+    if (!file || !file.name.endsWith('.json')) return;
+    try {
+      const data = JSON.parse(await file.text());
+      const meaningful = (data.actions || []).filter((a) => !a.cam);
+      if (meaningful.length > 0) {
+        window.__sim.replay(data);
+        toast(`▶ replaying ${file.name} (${data.actions.length} actions) — inputs unlock when done`, 4000);
+      } else {
+        // scene save (tap) or plain snapshot: restore state + viewport, no lock
+        window.__sim.loadSnapshot(data.snapshot || data);
+        const cam = (data.actions || []).find((a) => a.cam);
+        if (cam) {
+          orbit.yaw = cam.cam[0]; orbit.pitch = cam.cam[1]; orbit.dist = cam.cam[2];
+          updateCamera();
+        }
+        toast(`scene loaded: ${file.name}`);
+      }
+    } catch (err) {
+      toast('could not load file: ' + err.message, 4000);
+    }
+  });
 
   // ---- hose emission ----
   const NOZZLE_SPEED = 7.5;
@@ -459,7 +507,7 @@ async function init() {
     sim, renderer, camera,
     // play back a Space-hold recording bundle (snapshot + action log)
     replay(bundle) {
-      this.loadSnapshot(bundle.snapshot || bundle);
+      this.loadSnapshot(bundle.snapshot || bundle, true);
       const actions = bundle.actions || [];
       replaying = {
         actions, idx: 0, frame: 0,
@@ -468,7 +516,10 @@ async function init() {
     },
     isReplaying: () => !!replaying,
     // load a snapshot file's parsed JSON for exact-state repro
-    loadSnapshot(snap) {
+    loadSnapshot(snap, keepGrabs = false) {
+      // snapshots from before the second cube have no SOLID_DIM2 — their
+      // buffers are laid out without it, so replay them without one
+      if (snap.opts.SOLID_DIM2 === undefined) snap.opts.SOLID_DIM2 = 0;
       pointerDown = false;
       spraying = false;
       lastGrabPoint = null;
@@ -477,7 +528,7 @@ async function init() {
       sim = new GpuSim(device, snap.opts);
       renderer.attachSim(sim);
       old.dispose();
-      sim.restore(snap);
+      sim.restore(snap, keepGrabs);
       $('s-dim').value = snap.opts.SOLID_DIM;
       $('s-fluid').value = Math.round(Math.log2(snap.opts.MAX_FLUID));
       $('s-size').value = Math.round(snap.opts.params.solidRadius * 1000);

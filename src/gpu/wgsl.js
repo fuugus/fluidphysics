@@ -7,6 +7,8 @@ export const makeShaderSource = (C) => /* wgsl */ `
 // ---- constants baked at pipeline creation ----
 const SOLID_N: u32 = ${C.SOLID_N}u;
 const N_DIM: u32 = ${C.SOLID_DIM}u;
+const N1: u32 = ${C.N1}u;           // particle count of the first lattice
+const N_DIM2: u32 = ${Math.max(1, C.SOLID_DIM2)}u;
 const MAX_FLUID: u32 = ${C.MAX_FLUID}u;
 const TOTAL: u32 = ${C.TOTAL}u;
 const TABLE: u32 = ${C.TABLE}u;          // hash table size (pow2)
@@ -17,6 +19,10 @@ const SCAN_BLOCKS: u32 = ${C.SCAN_BLOCKS}u; // TABLE / 256
 const SCRATCH: u32 = TABLE + TABLE + TOTAL;
 const S_PICK: u32 = SCRATCH;       // packed atomicMin pick result
 const S_COUNT: u32 = SCRATCH + 1u; // active fluid counter
+// solid-contact pair cache (collected once per substep, iterated with bonds)
+const C_COUNT: u32 = SCRATCH + 8u;          // per-solid neighbor count
+const C_LIST: u32 = C_COUNT + SOLID_N;      // per-solid neighbor ids
+const C_K: u32 = 32u;                        // max cached neighbors
 
 const F_ACTIVE: u32 = 1u;
 const F_GRABBED: u32 = 2u;
@@ -60,7 +66,7 @@ struct Params {
   emitCount: u32,
   emitStart: u32,
   solidViscosity: f32,  // bonded-velocity smoothing (damps internal jiggle)
-  pad1: u32,
+  grabLattice: u32,     // restrict grab to one lattice (0xffff = any)
 
   emitPos: vec4f,       // xyz + speed in w
   emitDir: vec4f,       // xyz + phase in w
@@ -132,7 +138,9 @@ fn integrate(@builtin(global_invocation_id) g: vec3u) {
     }
     var corr = (t - np) * (P.grabK * density[i].y); // density.y = grip weight
     let cl = length(corr);
-    let maxC = 0.05; // caps follow speed (~20 m/s) — whip-fast but not teleport
+    // caps follow speed (~14 m/s) — must stay BELOW the contact resolution
+    // rate (2 passes x radius), or grab-pushing tunnels through bodies
+    let maxC = 0.035;
     if (cl > maxC) { corr *= maxC / cl; }
     np += corr;
     tw = t.x;
@@ -356,9 +364,12 @@ fn applyDeltaSolid(@builtin(global_invocation_id) g: vec3u) {
 // Doing this inside the solve gather raced: one endpoint could tear a bond
 // while the other still applied its correction — a one-sided impulse that
 // pumped momentum into ripped fragments.
-fn latticeRest(a: u32, b: u32) -> f32 {
-  let ax = f32(a / (N_DIM * N_DIM)); let ay = f32((a / N_DIM) % N_DIM); let az = f32(a % N_DIM);
-  let bx = f32(b / (N_DIM * N_DIM)); let by = f32((b / N_DIM) % N_DIM); let bz = f32(b % N_DIM);
+fn latticeRest(a0: u32, b0: u32) -> f32 {
+  // bonds never cross lattices, so both endpoints share the same indexing
+  var a = a0; var b = b0; var D = N_DIM;
+  if (a0 >= N1) { a = a0 - N1; b = b0 - N1; D = N_DIM2; }
+  let ax = f32(a / (D * D)); let ay = f32((a / D) % D); let az = f32(a % D);
+  let bx = f32(b / (D * D)); let by = f32((b / D) % D); let bz = f32(b % D);
   let dx = ax - bx; let dy = ay - by; let dz = az - bz;
   return P.spacing * sqrt(dx * dx + dy * dy + dz * dz);
 }
@@ -386,7 +397,96 @@ fn bondUpdate(@builtin(global_invocation_id) g: vec3u) {
   if (nr != rest) { cons[ci].z = bitcast<u32>(nr); }
 }
 
-// ============ contacts: solid-solid (non-bonded) + solid-fluid ============
+// same lattice AND neighboring grid cells — i.e. a potential cut face,
+// where the reduced contact distance must apply so severed neighbors can
+// rest at lattice spacing without fighting
+fn latticeAdjacent(i: u32, j: u32) -> bool {
+  if ((i >= N1) != (j >= N1)) { return false; }
+  var a = i; var b = j; var D = N_DIM;
+  if (i >= N1) { a = i - N1; b = j - N1; D = N_DIM2; }
+  let ax = i32(a / (D * D)); let ay = i32((a / D) % D); let az = i32(a % D);
+  let bx = i32(b / (D * D)); let by = i32((b / D) % D); let bz = i32(b % D);
+  return abs(ax - bx) <= 1 && abs(ay - by) <= 1 && abs(az - bz) <= 1;
+}
+
+// ============ solid contact cache + iterated resolution ============
+// Collected once per substep with a margin, then resolved interleaved with
+// the bond solve — bonds and contacts negotiate every iteration, so a
+// driven body cannot out-iterate the collision response (it deforms or
+// displaces the other body instead of tunneling into it).
+fn solidRsum(i: u32, j: u32) -> f32 {
+  let rsum = 2.0 * P.solidRadius;
+  if (latticeAdjacent(i, j)) { return min(rsum, P.spacing * 0.97); }
+  return rsum;
+}
+
+@compute @workgroup_size(256)
+fn collectContacts(@builtin(global_invocation_id) g: vec3u) {
+  let i = g.x;
+  if (i >= SOLID_N) { return; }
+  var cnt = 0u;
+  if ((flags[i] & F_ACTIVE) != 0u) {
+    let pi = pos[i].xyz;
+    // margin must exceed the fastest per-substep approach (grab drive +
+    // solver drift), or pairs entering range mid-substep tunnel unseen
+    let margin = 1.5 * P.solidRadius;
+    let c0 = vec3i(floor(pi / P.cellSize));
+    for (var dx = -1; dx <= 1; dx++) {
+    for (var dy = -1; dy <= 1; dy++) {
+    for (var dz = -1; dz <= 1; dz++) {
+      let r = cellRange(cellHash(c0 + vec3i(dx, dy, dz)));
+      for (var e = r.x; e < r.y; e++) {
+        let j = atomicLoad(&gridA[TABLE + TABLE + e]);
+        if (j == i || j >= SOLID_N || cnt >= C_K) { continue; }
+        let dd = pi - pos[j].xyz;
+        let lim = solidRsum(i, j) + margin;
+        if (dot(dd, dd) >= lim * lim) { continue; }
+        if (isBonded(i, j)) { continue; }
+        atomicStore(&gridA[C_LIST + i * C_K + cnt], j);
+        cnt++;
+      }
+    }}}
+  }
+  atomicStore(&gridA[C_COUNT + i], cnt);
+}
+
+@compute @workgroup_size(256)
+fn solidContacts(@builtin(global_invocation_id) g: vec3u) {
+  let i = g.x;
+  if (i >= SOLID_N || (flags[i] & F_ACTIVE) == 0u) { return; }
+  let pi = pos[i].xyz;
+  let wi = effInvMass(i);
+  var corr = vec3f(0.0);
+  let cnt = atomicLoad(&gridA[C_COUNT + i]);
+  for (var k = 0u; k < cnt; k++) {
+    let j = atomicLoad(&gridA[C_LIST + i * C_K + k]);
+    let dd = pi - pos[j].xyz;
+    let rsum = solidRsum(i, j);
+    let d2 = dot(dd, dd);
+    if (d2 >= rsum * rsum || d2 < 1e-12) { continue; }
+    let wj = effInvMass(j);
+    let wsum = wi + wj;
+    if (wsum == 0.0) { continue; }
+    let d = sqrt(d2);
+    // hard relative to bonds: cross-body repulsion beats internal springs,
+    // so the volume redistributes through the body instead of being entered
+    corr += dd * ((rsum - d) / d * wi / wsum * 0.5);
+  }
+  delta[i] = vec4f(corr, 1.0);
+}
+
+@compute @workgroup_size(256)
+fn applySolidContacts(@builtin(global_invocation_id) g: vec3u) {
+  let i = g.x;
+  if (i >= SOLID_N || (flags[i] & F_ACTIVE) == 0u) { return; }
+  var d = delta[i].xyz;
+  let maxC = 0.5 * P.solidRadius; // per iteration; the loop runs many
+  let m2 = dot(d, d);
+  if (m2 > maxC * maxC) { d *= maxC / sqrt(m2); }
+  pos[i] = vec4f(pos[i].xyz + d, pos[i].w);
+}
+
+// ============ contacts: solid-fluid coupling only ============
 fn isBonded(i: u32, j: u32) -> bool {
   let start = adj[i];
   let end = adj[i + 1u];
@@ -416,17 +516,13 @@ fn contacts(@builtin(global_invocation_id) g: vec3u) {
       let j = atomicLoad(&gridA[TABLE + TABLE + e]);
       if (j == i) { continue; }
       let jSolid = j < SOLID_N;
-      if (!iSolid && !jSolid) { continue; } // fluid-fluid handled by DDR
+      // fluid-fluid is DDR's job; solid-solid lives in the iterated cache
+      if (iSolid == jSolid) { continue; }
       let dd = pi - pos[j].xyz;
       let rj = select(P.fluidRadius, P.solidRadius, jSolid);
-      // solid-solid contacts use a reduced radius so that a freshly cut
-      // face (particles at lattice spacing, no longer bonded) is a valid
-      // rest state — otherwise contacts and constraints fight forever
-      var rsum = ri + rj;
-      if (iSolid && jSolid) { rsum = min(rsum, P.spacing * 0.97); }
+      let rsum = ri + rj;
       let d2 = dot(dd, dd);
       if (d2 >= rsum * rsum || d2 < 1e-12) { continue; }
-      if (iSolid && jSolid && isBonded(i, j)) { continue; }
       let wj = effInvMass(j);
       let wsum = wi + wj;
       if (wsum == 0.0) { continue; }
@@ -446,10 +542,11 @@ fn applyDeltaAll(@builtin(global_invocation_id) g: vec3u) {
   if (i >= TOTAL || (flags[i] & F_ACTIVE) == 0u) { return; }
   var d = delta[i].xyz;
   // safety clamp for pathological stacking (slightly breaks symmetry, but
-  // only in extremes where stability matters more)
+  // only in extremes where stability matters more). Must stay ABOVE the
+  // grab spring's per-substep drive, or sustained pushes tunnel through.
   let r = select(P.fluidRadius, P.solidRadius, i < SOLID_N);
   let m2 = dot(d, d);
-  if (m2 > 0.25 * r * r) { d *= 0.5 * r / sqrt(m2); }
+  if (m2 > r * r) { d *= r / sqrt(m2); }
   pos[i] = vec4f(pos[i].xyz + d, pos[i].w);
 }
 
@@ -638,6 +735,10 @@ fn pick(@builtin(global_invocation_id) g: vec3u) {
 fn grabSelect(@builtin(global_invocation_id) g: vec3u) {
   let i = g.x;
   if (i >= SOLID_N || (flags[i] & F_ACTIVE) == 0u) { return; }
+  // a grab holds exactly one body — never both sides of a contact, or the
+  // spring drives them into each other and bypasses collision entirely
+  let lat = select(0u, 1u, i >= N1);
+  if (P.grabLattice != 0xffffu && lat != P.grabLattice) { return; }
   let dd = pos[i].xyz - P.grabC.xyz;
   let q2 = dot(dd, dd) / (P.grabC.w * P.grabC.w);
   if (q2 < 1.0) {

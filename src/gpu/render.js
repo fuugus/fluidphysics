@@ -153,7 +153,8 @@ export class Renderer {
     if (this.materials) for (const m of Object.values(this.materials)) m.ub.destroy();
     this.materials = {};
     for (const [name, color, radius, base, count, shiny, fresnel] of [
-      ['jelly', [0.88, 0.12, 0.2], sim.o.params.solidRadius * 2.0, 0, sim.SOLID_N, 0.9, 0.5],
+      ['jelly', [0.88, 0.12, 0.2], sim.o.params.solidRadius * 2.0, 0, sim.N1, 0.9, 0.5],
+      ['jelly2', [0.15, 0.78, 0.45], sim.o.params.solidRadius * 2.0, sim.N1, sim.SOLID_N - sim.N1, 0.9, 0.5],
       ['water', [0.15, 0.5, 0.92], sim.o.params.fluidRadius * 1.8, sim.SOLID_N, sim.o.MAX_FLUID, 1.2, 0.9],
     ]) {
       const ub = d.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
@@ -330,7 +331,8 @@ export class Renderer {
 
     pass.setPipeline(this.impPipe);
     pass.setBindGroup(0, this.impCamBG);
-    for (const m of [this.materials.jelly, this.materials.water]) {
+    for (const m of Object.values(this.materials)) {
+      if (m.count === 0) continue;
       pass.setBindGroup(1, m.bg);
       pass.draw(4, m.count);
     }

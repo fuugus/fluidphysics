@@ -19,6 +19,7 @@ const b64decode = (s) => {
 
 export const DEFAULTS = {
   SOLID_DIM: 20,                // 20^3 = 8000 body particles
+  SOLID_DIM2: null,             // small companion cube (null = ~1/20 linear size)
   MAX_FLUID: 65536,
   TABLE: 1 << 18,
 
@@ -65,7 +66,8 @@ export const DEFAULTS = {
 const KERNELS = [
   'integrate', 'gridClear', 'gridCount', 'scanBlocks', 'scanPartials', 'scanApply',
   'gridScatter', 'fluidDensity', 'fluidDisp', 'applyDeltaFluid', 'solidSolve', 'bondUpdate',
-  'applyDeltaSolid', 'contacts', 'applyDeltaAll', 'bounds', 'velocityUpdate',
+  'applyDeltaSolid', 'collectContacts', 'solidContacts', 'applySolidContacts',
+  'contacts', 'applyDeltaAll', 'bounds', 'velocityUpdate',
   'solidVisc', 'solidViscApply',
   'xsph', 'xsphApply', 'emit', 'cut', 'pick', 'grabSelect', 'grabRelease', 'countActive',
 ];
@@ -76,7 +78,11 @@ export class GpuSim {
     const o = { ...DEFAULTS, ...opts };
     o.params = { ...DEFAULTS.params, ...(opts.params || {}) };
     this.o = o;
-    this.SOLID_N = o.SOLID_DIM ** 3;
+    // companion cube: 1/20 the volume → edge / cbrt(20)
+    this.DIM2 = o.SOLID_DIM2 ?? Math.max(2, Math.round((o.SOLID_DIM - 1) / Math.cbrt(20)) + 1);
+    o.SOLID_DIM2 = this.DIM2; // resolved value lands in snapshots
+    this.N1 = o.SOLID_DIM ** 3;
+    this.SOLID_N = this.N1 + this.DIM2 ** 3;
     this.TOTAL = this.SOLID_N + o.MAX_FLUID;
     this.substeps = o.substeps;
     this.solidIters = o.solidIters;
@@ -87,49 +93,56 @@ export class GpuSim {
     this._buildGpu();
   }
 
-  // ---- initial lattice + constraints on CPU (uploaded once) ----
+  // ---- initial lattices + constraints on CPU (uploaded once) ----
   _buildHostData() {
-    const { SOLID_DIM: n, spacing, cubeCenter, solidMass, fluidMass, MAX_FLUID } = this.o;
+    const { SOLID_DIM: n, spacing, cubeCenter, solidMass, fluidMass } = this.o;
+    const n2 = this.DIM2;
     const N = this.SOLID_N;
     const pos = new Float32Array(this.TOTAL * 4);
     const flags = new Uint32Array(this.TOTAL);
-    const half = (n - 1) * spacing / 2;
-    let id = 0;
-    for (let ix = 0; ix < n; ix++)
-      for (let iy = 0; iy < n; iy++)
-        for (let iz = 0; iz < n; iz++) {
-          pos.set([
-            cubeCenter[0] - half + ix * spacing,
-            cubeCenter[1] - half + iy * spacing,
-            cubeCenter[2] - half + iz * spacing,
-            1 / solidMass,
-          ], id * 4);
-          flags[id] = 1;
-          id++;
-        }
-    for (let i = N; i < this.TOTAL; i++) pos[i * 4 + 3] = 1 / fluidMass;
-
-    // constraints: 26-neighborhood (within sqrt(3)*spacing)
-    const idx = (ix, iy, iz) => (ix * n + iy) * n + iz;
     const consA = [], consB = [], consRest = [];
     const incident = Array.from({ length: N }, () => []);
     const maxD2 = 3 * spacing * spacing + 1e-9;
-    for (let ix = 0; ix < n; ix++)
-      for (let iy = 0; iy < n; iy++)
-        for (let iz = 0; iz < n; iz++)
-          for (let dx = -1; dx <= 1; dx++)
-            for (let dy = -1; dy <= 1; dy++)
-              for (let dz = -1; dz <= 1; dz++) {
-                const jx = ix + dx, jy = iy + dy, jz = iz + dz;
-                if (jx < 0 || jy < 0 || jz < 0 || jx >= n || jy >= n || jz >= n) continue;
-                const a = idx(ix, iy, iz), b = idx(jx, jy, jz);
-                if (b <= a) continue;
-                const d2 = (dx * dx + dy * dy + dz * dz) * spacing * spacing;
-                if (d2 > maxD2) continue;
-                const c = consA.length;
-                consA.push(a); consB.push(b); consRest.push(Math.sqrt(d2));
-                incident[a].push(c); incident[b].push(c);
-              }
+    let id = 0;
+
+    const addLattice = (dim, center) => {
+      const base = id;
+      const half = (dim - 1) * spacing / 2;
+      for (let ix = 0; ix < dim; ix++)
+        for (let iy = 0; iy < dim; iy++)
+          for (let iz = 0; iz < dim; iz++) {
+            pos.set([
+              center[0] - half + ix * spacing,
+              center[1] - half + iy * spacing,
+              center[2] - half + iz * spacing,
+              1 / solidMass,
+            ], id * 4);
+            flags[id] = 1;
+            id++;
+          }
+      // 26-neighborhood constraints (within sqrt(3)*spacing)
+      const idx = (ix, iy, iz) => base + (ix * dim + iy) * dim + iz;
+      for (let ix = 0; ix < dim; ix++)
+        for (let iy = 0; iy < dim; iy++)
+          for (let iz = 0; iz < dim; iz++)
+            for (let dx = -1; dx <= 1; dx++)
+              for (let dy = -1; dy <= 1; dy++)
+                for (let dz = -1; dz <= 1; dz++) {
+                  const jx = ix + dx, jy = iy + dy, jz = iz + dz;
+                  if (jx < 0 || jy < 0 || jz < 0 || jx >= dim || jy >= dim || jz >= dim) continue;
+                  const a = idx(ix, iy, iz), b = idx(jx, jy, jz);
+                  if (b <= a) continue;
+                  const d2 = (dx * dx + dy * dy + dz * dz) * spacing * spacing;
+                  if (d2 > maxD2) continue;
+                  const c = consA.length;
+                  consA.push(a); consB.push(b); consRest.push(Math.sqrt(d2));
+                  incident[a].push(c); incident[b].push(c);
+                }
+    };
+
+    addLattice(n, cubeCenter);
+    if (n2 > 0) addLattice(n2, [1.1, (n2 - 1) * spacing / 2 + 0.5, 0.7]);
+    for (let i = N; i < this.TOTAL; i++) pos[i * 4 + 3] = 1 / fluidMass;
     this.NUM_CONS = consA.length;
 
     const cons = new Uint32Array(this.NUM_CONS * 4);
@@ -168,7 +181,7 @@ export class GpuSim {
       density: mk(N * 8),
       cons: mk(this.NUM_CONS * 16),
       adj: mk((this.SOLID_N + 1 + 2 * this.NUM_CONS) * 4),
-      gridA: mk((TABLE * 2 + N + 8) * 4),
+      gridA: mk((TABLE * 2 + N + 8 + this.SOLID_N * 33) * 4), // + solid contact cache
       gridS: mk((TABLE + 1 + TABLE / 256) * 4),
       params: d.createBuffer({ size: 304, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }),
     };
@@ -179,7 +192,8 @@ export class GpuSim {
     };
 
     const code = makeShaderSource({
-      SOLID_N: this.SOLID_N, SOLID_DIM: this.o.SOLID_DIM, MAX_FLUID, TOTAL: N, TABLE,
+      SOLID_N: this.SOLID_N, SOLID_DIM: this.o.SOLID_DIM, N1: this.N1, SOLID_DIM2: this.DIM2,
+      MAX_FLUID, TOTAL: N, TABLE,
       NUM_CONS: this.NUM_CONS, SCAN_BLOCKS: TABLE / 256,
     });
     const module = d.createShaderModule({ code });
@@ -244,6 +258,7 @@ export class GpuSim {
     pu[28] = pend.emitCount;
     pu[29] = pend.emitStart || 0;
     pf[30] = p.solidViscosity;
+    pu[31] = pend.grabLattice ?? 0xffff;
     const v4 = (o, arr) => pf.set(arr, o);
     v4(32, pend.emitPos || [0, 0, 0, 0]);
     v4(36, pend.emitDir || [0, 0, 0, 0]);
@@ -292,12 +307,16 @@ export class GpuSim {
       run('fluidDensity', wg(this.o.MAX_FLUID));
       run('fluidDisp', wg(this.o.MAX_FLUID));
       run('applyDeltaFluid', wg(this.o.MAX_FLUID));
+      // unified loop: bonds and contacts negotiate every iteration
+      run('collectContacts', wg(this.SOLID_N));
       for (let it = 0; it < this.solidIters; it++) {
         run('solidSolve', wg(this.SOLID_N));
         run('applyDeltaSolid', wg(this.SOLID_N));
+        run('solidContacts', wg(this.SOLID_N));
+        run('applySolidContacts', wg(this.SOLID_N));
       }
       run('bondUpdate', wg(this.NUM_CONS));
-      run('contacts', wg(this.TOTAL));
+      run('contacts', wg(this.TOTAL)); // solid-fluid coupling
       run('applyDeltaAll', wg(this.TOTAL));
       run('bounds', wg(this.TOTAL));
       run('velocityUpdate', wg(this.TOTAL));
@@ -358,8 +377,9 @@ export class GpuSim {
     return { id: packed & 0xffff, t: (packed >>> 16) / 1000 };
   }
 
-  grabAt(center, radius) {
+  grabAt(center, radius, lattice = 0xffff) {
     this.pending.grabC = [...center, radius];
+    this.pending.grabLattice = lattice;
     this.pending.grabbing = true;
     this._writeParams();
     const enc = this.device.createCommandEncoder();
@@ -431,12 +451,14 @@ export class GpuSim {
     };
   }
 
-  restore(snap) {
+  restore(snap, keepGrabs = false) {
     const q = this.device.queue;
     for (const [name, data] of Object.entries(snap.buffers)) {
       const buf = b64decode(data);
-      if (name === 'flags') {
-        // clear grab bits — the snapshot may have been taken mid-grab
+      if (name === 'flags' && !keepGrabs) {
+        // standalone snapshot: clear grab bits (no release will ever come).
+        // Recordings keep them — grab targets live in the snapshotted
+        // buffers, so an in-flight grab replays exactly.
         const f = new Uint32Array(buf);
         for (let i = 0; i < f.length; i++) f[i] &= ~2;
       }
