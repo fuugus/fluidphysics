@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Slice &amp; Splash — unified particle playground</title>
+<link rel="icon" href="data:," />
+<style>
+  * { margin: 0; box-sizing: border-box; }
+  body { overflow: hidden; font-family: system-ui, sans-serif; background: #10141c; }
+  canvas { display: block; }
+  #ui {
+    position: fixed; top: 16px; left: 16px; padding: 14px 16px;
+    background: rgba(16, 20, 28, 0.72); backdrop-filter: blur(10px);
+    border: 1px solid rgba(255,255,255,0.08); border-radius: 14px;
+    color: #dfe6f0; user-select: none; max-width: 280px;
+  }
+  #ui h1 { font-size: 15px; font-weight: 650; margin-bottom: 2px; }
+  #ui .sub { font-size: 11px; color: #8a96a8; margin-bottom: 10px; }
+  .row { display: flex; gap: 6px; margin-bottom: 8px; }
+  button {
+    flex: 1; padding: 8px 6px; border-radius: 9px; cursor: pointer;
+    border: 1px solid rgba(255,255,255,0.1); background: rgba(255,255,255,0.05);
+    color: #dfe6f0; font-size: 12.5px; font-weight: 550; transition: all .12s;
+  }
+  button:hover { background: rgba(255,255,255,0.12); }
+  button.on { background: #2f6fed; border-color: #2f6fed; color: #fff; }
+  button.small { flex: initial; font-size: 11.5px; padding: 6px 10px; }
+  kbd {
+    font: 10px ui-monospace, monospace; background: rgba(255,255,255,0.1);
+    border-radius: 4px; padding: 1px 4px; margin-left: 4px;
+  }
+  #hint { font-size: 11.5px; color: #9fb0c8; line-height: 1.45; min-height: 32px; }
+  #stats {
+    position: fixed; bottom: 12px; right: 14px; font: 11px ui-monospace, monospace;
+    color: #6e7d92; user-select: none;
+  }
+</style>
+</head>
+<body>
+  <div id="ui">
+    <h1>Slice &amp; Splash</h1>
+    <div class="sub">unified XPBD particles — soft body · slicing · fluid</div>
+    <div class="row">
+      <button data-tool="grab">🖐 Grab<kbd>1</kbd></button>
+      <button data-tool="knife">🔪 Slice<kbd>2</kbd></button>
+      <button data-tool="hose">🚿 Hose<kbd>3</kbd></button>
+    </div>
+    <div class="row">
+      <button id="reset" class="small">↺ New cube<kbd>R</kbd></button>
+      <button id="drain" class="small">🕳 Drain water<kbd>C</kbd></button>
+    </div>
+    <div id="hint"></div>
+  </div>
+  <div id="stats"></div>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "./node_modules/three/build/three.module.js",
+      "three/addons/": "./node_modules/three/examples/jsm/"
+    }
+  }
+  </script>
+  <script type="module" src="./src/main.js"></script>
+</body>
+</html>
