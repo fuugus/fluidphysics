@@ -45,7 +45,7 @@ export const DEFAULTS = {
     omega: 1.5,
     plasticThreshold: 0.38,
     plasticRate: 0.04,
-    tearGap: 1.0,
+    tearGap: 1.3,
     maxSpeed: 14,
     wallX: 3.5,
     wallZ: 3.5,
@@ -56,7 +56,7 @@ export const DEFAULTS = {
     dampFluid: 0.6,
     frictionSolid: 0.4,
     frictionFluid: 0.04,
-    grabK: 0.3,
+    grabK: 0.6,
     sleepSpeed: 0,      // band-aids, retired since the momentum fix —
     solidViscosity: 0,  // params kept so they can be re-enabled for testing
   },

@@ -222,7 +222,7 @@ async function init() {
     grabDepth = hit.t;
     const p = ro.clone().addScaledVector(rd, hit.t);
     lastGrabPoint = p.clone();
-    sim.grabAt([p.x, p.y, p.z], 0.3);
+    sim.grabAt([p.x, p.y, p.z], 0.45);
     canvas.style.cursor = 'grabbing';
   }
 

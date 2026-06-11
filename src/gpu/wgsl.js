@@ -120,9 +120,19 @@ fn integrate(@builtin(global_invocation_id) g: vec3u) {
     // stashed in otherwise-unused w/x slots: (prev.w, vel.w, density.x)
     var t = vec3f(prev[i].w, vel[i].w, density[i].x);
     t += P.grabDelta.xyz;
+    // grip slips when overstretched — releases stragglers whose piece was
+    // ripped away from the grabbed cluster (they'd otherwise keep towing
+    // their body toward the cursor forever)
+    if (distance(np, t) > 1.0) {
+      flags[i] &= ~F_GRABBED;
+      prev[i] = vec4f(p, tw);
+      pos[i] = vec4f(np, pos[i].w);
+      vel[i] = vec4f(v, 0.0);
+      return;
+    }
     var corr = (t - np) * P.grabK;
     let cl = length(corr);
-    let maxC = 0.02; // caps follow speed — fast mouse stretches, not teleports
+    let maxC = 0.05; // caps follow speed (~20 m/s) — whip-fast but not teleport
     if (cl > maxC) { corr *= maxC / cl; }
     np += corr;
     tw = t.x;
