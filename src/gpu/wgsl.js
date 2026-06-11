@@ -22,7 +22,13 @@ const S_COUNT: u32 = SCRATCH + 1u; // active fluid counter
 // solid-contact pair cache (collected once per substep, iterated with bonds)
 const C_COUNT: u32 = SCRATCH + 8u;          // per-solid neighbor count
 const C_LIST: u32 = C_COUNT + SOLID_N;      // per-solid neighbor ids
-const C_K: u32 = 32u;                        // max cached neighbors
+const C_K: u32 = 40u;                        // max cached neighbors
+
+// tet volume data packed in the gridS tail
+const NUM_TETS: u32 = ${C.NUM_TETS}u;
+const TS_TETS: u32 = ${C.TS_TETS}u;                  // [a,b,c,d,restVol] x NUM_TETS
+const T_ADJ_OFF: u32 = TS_TETS + NUM_TETS * 5u;      // CSR offsets [SOLID_N+1]
+const T_ADJ_DATA: u32 = T_ADJ_OFF + SOLID_N + 1u;    // incident tet ids
 
 const F_ACTIVE: u32 = 1u;
 const F_GRABBED: u32 = 2u;
@@ -138,9 +144,9 @@ fn integrate(@builtin(global_invocation_id) g: vec3u) {
     }
     var corr = (t - np) * (P.grabK * density[i].y); // density.y = grip weight
     let cl = length(corr);
-    // caps follow speed (~14 m/s) — must stay BELOW the contact resolution
-    // rate (2 passes x radius), or grab-pushing tunnels through bodies
-    let maxC = 0.035;
+    // caps follow speed — must stay below the per-substep contact resolution
+    // capacity (iters x clamp) and inside the collect margin
+    let maxC = 0.05;
     if (cl > maxC) { corr *= maxC / cl; }
     np += corr;
     tw = t.x;
@@ -409,6 +415,109 @@ fn latticeAdjacent(i: u32, j: u32) -> bool {
   return abs(ax - bx) <= 1 && abs(ay - by) <= 1 && abs(az - bz) <= 1;
 }
 
+// ============ tet volume constraints ============
+// Each lattice cell is 5 tets whose signed volume is held at its rest
+// value (XPBD, zero compliance). This is what conserves volume: press a
+// region and its tets can only comply by expanding perpendicular — the
+// body bulges instead of compressing away.
+@compute @workgroup_size(256)
+fn solveTets(@builtin(global_invocation_id) g: vec3u) {
+  let i = g.x;
+  if (i >= SOLID_N || (flags[i] & F_ACTIVE) == 0u) { return; }
+  var corr = vec3f(0.0);
+  let start = gridS[T_ADJ_OFF + i];
+  let end = gridS[T_ADJ_OFF + i + 1u];
+  for (var k = start; k < end; k++) {
+    let t = gridS[T_ADJ_DATA + k];
+    let base = TS_TETS + t * 5u;
+    let ia = gridS[base];
+    let ib = gridS[base + 1u];
+    let ic = gridS[base + 2u];
+    let id = gridS[base + 3u];
+    let V0 = bitcast<f32>(gridS[base + 4u]);
+    if (V0 <= 0.0) { continue; } // dead tet (torn/cut)
+    let pa = pos[ia].xyz; let pb = pos[ib].xyz;
+    let pc = pos[ic].xyz; let pd = pos[id].xyz;
+    let V = dot(cross(pb - pa, pc - pa), pd - pa) / 6.0;
+    let C = V - V0;
+    // volume gradients (sum to zero -> momentum conserved exactly when all
+    // four endpoints apply the same scale)
+    let gb = cross(pc - pa, pd - pa) / 6.0;
+    let gc = cross(pd - pa, pb - pa) / 6.0;
+    let gd = cross(pb - pa, pc - pa) / 6.0;
+    let ga = -(gb + gc + gd);
+    let w = pos[ia].w; // solids share inv mass
+    let denom = w * (dot(ga, ga) + dot(gb, gb) + dot(gc, gc) + dot(gd, gd));
+    if (denom < 1e-12) { continue; }
+    let dl = -C / denom;
+    // identical pair scale for all four endpoints: 1/max(incident tets)
+    let dm = max(max(gridS[T_ADJ_OFF + ia + 1u] - gridS[T_ADJ_OFF + ia],
+                     gridS[T_ADJ_OFF + ib + 1u] - gridS[T_ADJ_OFF + ib]),
+                 max(gridS[T_ADJ_OFF + ic + 1u] - gridS[T_ADJ_OFF + ic],
+                     gridS[T_ADJ_OFF + id + 1u] - gridS[T_ADJ_OFF + id]));
+    let s = 1.0 / f32(max(dm, 1u));
+    var gMine = ga;
+    if (i == ib) { gMine = gb; } else if (i == ic) { gMine = gc; } else if (i == id) { gMine = gd; }
+    var c1 = gMine * (w * dl * s);
+    let cl2 = dot(c1, c1);
+    let lim = 0.5 * P.solidRadius; // per-tet contribution cap (degenerate tets)
+    if (cl2 > lim * lim) { c1 *= lim / sqrt(cl2); }
+    corr += c1;
+  }
+  delta[i] = vec4f(corr, 1.0);
+}
+
+// kill tets whose edges overstretch (same rule as bond ripping) — a cut or
+// torn region must stop conserving volume across the gap
+@compute @workgroup_size(256)
+fn tetUpdate(@builtin(global_invocation_id) g: vec3u) {
+  let t = g.x;
+  if (t >= NUM_TETS) { return; }
+  let base = TS_TETS + t * 5u;
+  let V0 = bitcast<f32>(gridS[base + 4u]);
+  if (V0 <= 0.0) { return; }
+  let gap = P.tearGap * 2.0 * P.solidRadius;
+  for (var p = 0u; p < 3u; p++) {
+    for (var q = p + 1u; q < 4u; q++) {
+      let a = gridS[base + p];
+      let b = gridS[base + q];
+      let d = distance(pos[a].xyz, pos[b].xyz);
+      if (d > latticeRest(a, b) + gap) {
+        gridS[base + 4u] = bitcast<u32>(-V0);
+        return;
+      }
+    }
+  }
+}
+
+// knife: kill tets whose edges cross the swept wedge
+@compute @workgroup_size(256)
+fn cutTets(@builtin(global_invocation_id) g: vec3u) {
+  let t = g.x;
+  if (t >= NUM_TETS) { return; }
+  let base = TS_TETS + t * 5u;
+  let V0 = bitcast<f32>(gridS[base + 4u]);
+  if (V0 <= 0.0) { return; }
+  let o = P.cutO.xyz;
+  let n = cross(P.cutD1.xyz, P.cutD2.xyz);
+  if (dot(n, n) < 1e-16) { return; }
+  for (var p = 0u; p < 3u; p++) {
+    for (var q = p + 1u; q < 4u; q++) {
+      let pa = pos[gridS[base + p]].xyz - o;
+      let pb = pos[gridS[base + q]].xyz - o;
+      let sa = dot(pa, n);
+      let sb = dot(pb, n);
+      if (sa * sb >= 0.0) { continue; }
+      let tt = sa / (sa - sb);
+      let pp = pa + (pb - pa) * tt;
+      if (dot(cross(P.cutD1.xyz, pp), n) < 0.0) { continue; }
+      if (dot(cross(pp, P.cutD2.xyz), n) < 0.0) { continue; }
+      gridS[base + 4u] = bitcast<u32>(-V0);
+      return;
+    }
+  }
+}
+
 // ============ solid contact cache + iterated resolution ============
 // Collected once per substep with a margin, then resolved interleaved with
 // the bond solve — bonds and contacts negotiate every iteration, so a
@@ -429,7 +538,7 @@ fn collectContacts(@builtin(global_invocation_id) g: vec3u) {
     let pi = pos[i].xyz;
     // margin must exceed the fastest per-substep approach (grab drive +
     // solver drift), or pairs entering range mid-substep tunnel unseen
-    let margin = 1.5 * P.solidRadius;
+    let margin = 2.0 * P.solidRadius;
     let c0 = vec3i(floor(pi / P.cellSize));
     for (var dx = -1; dx <= 1; dx++) {
     for (var dy = -1; dy <= 1; dy++) {

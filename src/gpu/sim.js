@@ -29,7 +29,7 @@ export const DEFAULTS = {
   cubeCenter: [0, 1.8, 0],
 
   substeps: 5,
-  solidIters: 6,
+  solidIters: 8,
 
   params: {
     h: 1 / 300,
@@ -42,7 +42,7 @@ export const DEFAULTS = {
     stiffness: 0.0015,
     nearStiffness: 0.006,
     viscosity: 0.3,
-    compliance: 3e-5,
+    compliance: 5e-4,   // gelatin regime: shear much softer than volume (tets)
     omega: 1.5,
     plasticThreshold: 0.38,
     plasticRate: 0.04,
@@ -67,6 +67,7 @@ const KERNELS = [
   'integrate', 'gridClear', 'gridCount', 'scanBlocks', 'scanPartials', 'scanApply',
   'gridScatter', 'fluidDensity', 'fluidDisp', 'applyDeltaFluid', 'solidSolve', 'bondUpdate',
   'applyDeltaSolid', 'collectContacts', 'solidContacts', 'applySolidContacts',
+  'solveTets', 'tetUpdate', 'cutTets',
   'contacts', 'applyDeltaAll', 'bounds', 'velocityUpdate',
   'solidVisc', 'solidViscApply',
   'xsph', 'xsphApply', 'emit', 'cut', 'pick', 'grabSelect', 'grabRelease', 'countActive',
@@ -140,10 +141,57 @@ export class GpuSim {
                 }
     };
 
+    // tetrahedral volume constraints: 5 tets per lattice cell, mirrored on
+    // checkerboard parity so faces match. Volume conservation is what makes
+    // a pressed body bulge sideways instead of just compressing.
+    const tets = []; // [a, b, c, d, restVolume]
+    const signedVol = (a, b, c, d) => {
+      const v = (p, q) => [pos[q*4]-pos[p*4], pos[q*4+1]-pos[p*4+1], pos[q*4+2]-pos[p*4+2]];
+      const ab = v(a, b), ac = v(a, c), ad = v(a, d);
+      return (ab[1]*ac[2]-ab[2]*ac[1])*ad[0] + (ab[2]*ac[0]-ab[0]*ac[2])*ad[1] + (ab[0]*ac[1]-ab[1]*ac[0])*ad[2];
+    };
+    const addTets = (dim, base) => {
+      const idx = (ix, iy, iz) => base + (ix * dim + iy) * dim + iz;
+      for (let ix = 0; ix < dim - 1; ix++)
+        for (let iy = 0; iy < dim - 1; iy++)
+          for (let iz = 0; iz < dim - 1; iz++) {
+            const c = (dx, dy, dz) => idx(ix + dx, iy + dy, iz + dz);
+            const A = c(0,0,0), B = c(1,0,0), C = c(1,1,0), D = c(0,1,0);
+            const E = c(0,0,1), F = c(1,0,1), G = c(1,1,1), H = c(0,1,1);
+            const five = (ix + iy + iz) % 2 === 0
+              ? [[A,C,F,H], [A,B,C,F], [A,C,D,H], [A,E,F,H], [C,F,G,H]]
+              : [[B,D,E,G], [A,B,D,E], [B,C,D,G], [D,E,H,G], [B,E,F,G]];
+            for (const t of five) tets.push([...t, signedVol(...t) / 6]);
+          }
+    };
+
     addLattice(n, cubeCenter);
-    if (n2 > 0) addLattice(n2, [1.1, (n2 - 1) * spacing / 2 + 0.5, 0.7]);
+    addTets(n, 0);
+    if (n2 > 0) {
+      addLattice(n2, [1.1, (n2 - 1) * spacing / 2 + 0.5, 0.7]);
+      addTets(n2, n ** 3);
+    }
     for (let i = N; i < this.TOTAL; i++) pos[i * 4 + 3] = 1 / fluidMass;
     this.NUM_CONS = consA.length;
+    this.NUM_TETS = tets.length;
+
+    // pack tets + per-particle tet adjacency (CSR) for the gridS tail
+    const tetData = new Uint32Array(this.NUM_TETS * 5);
+    const tetDataF = new Float32Array(tetData.buffer);
+    const tetInc = Array.from({ length: N }, () => []);
+    tets.forEach((t, k) => {
+      tetData.set(t.slice(0, 4), k * 5);
+      tetDataF[k * 5 + 4] = t[4];
+      for (let q = 0; q < 4; q++) tetInc[t[q]].push(k);
+    });
+    const tetAdj = new Uint32Array(N + 1 + 4 * this.NUM_TETS);
+    let toff = 0;
+    for (let i = 0; i < N; i++) {
+      tetAdj[i] = toff;
+      for (const k of tetInc[i]) tetAdj[N + 1 + toff++] = k;
+    }
+    tetAdj[N] = toff;
+    this.initTets = { tetData, tetAdj };
 
     const cons = new Uint32Array(this.NUM_CONS * 4);
     const consF = new Float32Array(cons.buffer);
@@ -181,8 +229,9 @@ export class GpuSim {
       density: mk(N * 8),
       cons: mk(this.NUM_CONS * 16),
       adj: mk((this.SOLID_N + 1 + 2 * this.NUM_CONS) * 4),
-      gridA: mk((TABLE * 2 + N + 8 + this.SOLID_N * 33) * 4), // + solid contact cache
-      gridS: mk((TABLE + 1 + TABLE / 256) * 4),
+      gridA: mk((TABLE * 2 + N + 8 + this.SOLID_N * 41) * 4), // + solid contact cache
+      // gridS tail carries tet volume data: [scan][tets 5xu32][adj CSR]
+      gridS: mk((TABLE + 1 + TABLE / 256 + this.NUM_TETS * 5 + this.SOLID_N + 1 + this.NUM_TETS * 4) * 4),
       params: d.createBuffer({ size: 304, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }),
     };
     this.staging = {
@@ -191,10 +240,12 @@ export class GpuSim {
       read: d.createBuffer({ size: N * 36, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ }),
     };
 
+    this.TS_TETS = TABLE + 1 + TABLE / 256;
     const code = makeShaderSource({
       SOLID_N: this.SOLID_N, SOLID_DIM: this.o.SOLID_DIM, N1: this.N1, SOLID_DIM2: this.DIM2,
       MAX_FLUID, TOTAL: N, TABLE,
       NUM_CONS: this.NUM_CONS, SCAN_BLOCKS: TABLE / 256,
+      NUM_TETS: this.NUM_TETS, TS_TETS: this.TS_TETS,
     });
     const module = d.createShaderModule({ code });
 
@@ -225,6 +276,8 @@ export class GpuSim {
 
     this.resetSolid();
     this.device.queue.writeBuffer(this.buf.adj, 0, this.init.adj);
+    this.device.queue.writeBuffer(this.buf.gridS,
+      (this.TS_TETS + this.NUM_TETS * 5) * 4, this.initTets.tetAdj);
   }
 
   resetSolid() {
@@ -235,6 +288,7 @@ export class GpuSim {
     q.writeBuffer(this.buf.flags, 0, this.init.flags.slice(0, this.SOLID_N), 0);
     q.writeBuffer(this.buf.cons, 0, this.init.cons);
     q.writeBuffer(this.buf.density, 0, new Float32Array(this.SOLID_N * 2));
+    q.writeBuffer(this.buf.gridS, this.TS_TETS * 4, this.initTets.tetData);
   }
 
   clearFluid() {
@@ -307,15 +361,18 @@ export class GpuSim {
       run('fluidDensity', wg(this.o.MAX_FLUID));
       run('fluidDisp', wg(this.o.MAX_FLUID));
       run('applyDeltaFluid', wg(this.o.MAX_FLUID));
-      // unified loop: bonds and contacts negotiate every iteration
+      // unified loop: bonds, volume, and contacts negotiate every iteration
       run('collectContacts', wg(this.SOLID_N));
       for (let it = 0; it < this.solidIters; it++) {
         run('solidSolve', wg(this.SOLID_N));
         run('applyDeltaSolid', wg(this.SOLID_N));
+        run('solveTets', wg(this.SOLID_N));
+        run('applySolidContacts', wg(this.SOLID_N)); // unit-scale apply + clamp
         run('solidContacts', wg(this.SOLID_N));
         run('applySolidContacts', wg(this.SOLID_N));
       }
       run('bondUpdate', wg(this.NUM_CONS));
+      run('tetUpdate', wg(this.NUM_TETS));
       run('contacts', wg(this.TOTAL)); // solid-fluid coupling
       run('applyDeltaAll', wg(this.TOTAL));
       run('bounds', wg(this.TOTAL));
@@ -327,7 +384,10 @@ export class GpuSim {
       run('xsph', wg(this.o.MAX_FLUID));
       run('xsphApply', wg(this.o.MAX_FLUID));
     }
-    if (cutThisFrame) run('cut', wg(this.NUM_CONS));
+    if (cutThisFrame) {
+      run('cut', wg(this.NUM_CONS));
+      run('cutTets', wg(this.NUM_TETS));
+    }
     run('countActive', wg(this.o.MAX_FLUID));
     pass.end();
 
@@ -447,14 +507,33 @@ export class GpuSim {
         flags: await read('flags', N * 4),
         density: await read('density', N * 8),
         cons: await read('cons', this.NUM_CONS * 16),
+        tets: b64encode(await this._readBufferAt(this.buf.gridS, this.TS_TETS * 4, this.NUM_TETS * 20)),
       },
     };
+  }
+
+  async _readBufferAt(buf, offset, size) {
+    const st = this.device.createBuffer({ size, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const enc = this.device.createCommandEncoder();
+    enc.copyBufferToBuffer(buf, offset, st, 0, size);
+    this.device.queue.submit([enc.finish()]);
+    await st.mapAsync(GPUMapMode.READ);
+    const data = st.getMappedRange().slice(0);
+    st.destroy();
+    return data;
   }
 
   restore(snap, keepGrabs = false) {
     const q = this.device.queue;
     for (const [name, data] of Object.entries(snap.buffers)) {
       const buf = b64decode(data);
+      if (name === 'tets') {
+        // mutable tet state lives inside gridS (old snapshots lack it —
+        // they restore with all tets alive, which matches their epoch)
+        if (buf.byteLength === this.NUM_TETS * 20)
+          q.writeBuffer(this.buf.gridS, this.TS_TETS * 4, buf);
+        continue;
+      }
       if (name === 'flags' && !keepGrabs) {
         // standalone snapshot: clear grab bits (no release will ever come).
         // Recordings keep them — grab targets live in the snapshotted

@@ -13,8 +13,9 @@ async function init() {
     requiredFeatures: hasTs ? ['timestamp-query'] : [],
     requiredLimits: { maxStorageBuffersPerShaderStage: 10 },
   });
+  const VERSION = 'v0.2-tets';
   const info = adapter.info || {};
-  $('gpu-name').textContent = `${info.vendor || 'gpu'} ${info.architecture || ''}`.trim();
+  $('gpu-name').textContent = `${VERSION} · ${info.vendor || 'gpu'} ${info.architecture || ''}`.trim();
   device.addEventListener('uncapturederror', (e) => {
     console.error('WebGPU uncaptured:', e.error.constructor.name, e.error.message.slice(0, 800));
   });
