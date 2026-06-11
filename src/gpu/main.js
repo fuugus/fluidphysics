@@ -192,9 +192,7 @@ async function init() {
     swipeMesh.update(verts, n * 6);
   }
 
-  // ---- tools ----
-  const TOOLS = ['grab', 'slice', 'hose'];
-  let tool = 'grab';
+  // ---- tools: left = slice, shift+left = hose, right = grab, middle = orbit ----
   const ray = new THREE.Raycaster();
   const ndc = new THREE.Vector2();
   const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
@@ -205,18 +203,6 @@ async function init() {
   let spraying = false;
   let sprayPhase = 0;
   const hoseTarget = new THREE.Vector3();
-
-  function setTool(t) {
-    tool = t;
-    document.querySelectorAll('[data-tool]').forEach((b) =>
-      b.classList.toggle('on', b.dataset.tool === t));
-    $('hint').textContent = {
-      grab: 'Left- or right-drag the cube to move it. Middle-drag orbits, wheel zooms.',
-      slice: 'Left-drag a stroke across the cube — you cut what you see under it. Right-drag grabs, middle-drag orbits.',
-      hose: 'Hold left mouse to spray, aim with the mouse. Right-drag grabs, middle-drag orbits.',
-    }[t];
-    canvas.style.cursor = t === 'grab' ? 'grab' : 'crosshair';
-  }
 
   function updateRay(e) {
     ndc.set((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
@@ -239,17 +225,17 @@ async function init() {
 
   canvas.addEventListener('pointerdown', (e) => {
     if (e.button === 1) { e.preventDefault(); orbiting = { x: e.clientX, y: e.clientY }; return; }
-    if (e.button === 2) { startGrab(e, 2); return; } // right = grab, any tool
+    if (e.button === 2) { startGrab(e, 2); return; } // right = grab
     if (e.button !== 0) return;
     updateRay(e);
     pointerDown = true;
-    if (tool === 'grab') {
-      startGrab(e, 0);
-    } else if (tool === 'slice') {
+    if (e.shiftKey) {
+      spraying = true;
+      const gp = new THREE.Vector3();
+      if (ray.ray.intersectPlane(groundPlane, gp)) hoseTarget.copy(gp);
+    } else {
       prevRayDir = ray.ray.direction.clone();
       swipePts.push({ x: e.clientX, y: e.clientY, t: performance.now() });
-    } else if (tool === 'hose') {
-      spraying = true;
     }
   });
 
@@ -274,15 +260,13 @@ async function init() {
       if (d.length() > MAX_DRAG) d.setLength(MAX_DRAG);
       sim.pending.grabDelta = [d.x, d.y, d.z];
       lastGrabPoint.add(d);
-    } else if (tool === 'slice') {
-      if (pointerDown && prevRayDir) {
-        sim.queueCut([ro.x, ro.y, ro.z],
-          [prevRayDir.x, prevRayDir.y, prevRayDir.z], [rd.x, rd.y, rd.z]);
-        prevRayDir.copy(rd);
-        swipePts.push({ x: e.clientX, y: e.clientY, t: performance.now() });
-      }
-    } else if (tool === 'hose' && gp) {
+    } else if (spraying && gp) {
       hoseTarget.copy(gp);
+    } else if (pointerDown && prevRayDir) {
+      sim.queueCut([ro.x, ro.y, ro.z],
+        [prevRayDir.x, prevRayDir.y, prevRayDir.z], [rd.x, rd.y, rd.z]);
+      prevRayDir.copy(rd);
+      swipePts.push({ x: e.clientX, y: e.clientY, t: performance.now() });
     }
   });
 
@@ -292,7 +276,7 @@ async function init() {
     if (e.button === grabButton) {
       grabButton = null;
       if (lastGrabPoint) { sim.release(); lastGrabPoint = null; }
-      canvas.style.cursor = tool === 'grab' ? 'grab' : 'crosshair';
+      canvas.style.cursor = 'crosshair';
     }
     if (e.button === 0) {
       pointerDown = false;
@@ -308,17 +292,12 @@ async function init() {
   }, { passive: false });
 
   addEventListener('keydown', (e) => {
-    if (e.key === '1') setTool('grab');
-    if (e.key === '2') setTool('slice');
-    if (e.key === '3') setTool('hose');
     if (e.key === 'r' || e.key === 'R') sim.resetSolid();
     if (e.key === 'c' || e.key === 'C') sim.clearFluid();
   });
-  document.querySelectorAll('[data-tool]').forEach((b) =>
-    b.addEventListener('click', () => setTool(b.dataset.tool)));
   $('reset').addEventListener('click', () => sim.resetSolid());
   $('drain').addEventListener('click', () => sim.clearFluid());
-  setTool('grab');
+  canvas.style.cursor = 'crosshair';
   addEventListener('resize', updateCamera);
 
   // ---- hose emission ----

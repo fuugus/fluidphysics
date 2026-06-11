@@ -61,11 +61,6 @@
     <div class="sub">unified XPBD particles on WebGPU compute · <span id="gpu-name"></span><br>
       <a href="classic.html">classic CPU version</a></div>
     <div class="row">
-      <button data-tool="grab">🖐 Grab<kbd>1</kbd></button>
-      <button data-tool="slice">🔪 Slice<kbd>2</kbd></button>
-      <button data-tool="hose">🚿 Hose<kbd>3</kbd></button>
-    </div>
-    <div class="row">
       <button id="reset" class="small">↺ New cube<kbd>R</kbd></button>
       <button id="drain" class="small">🕳 Drain water<kbd>C</kbd></button>
     </div>
@@ -80,7 +75,8 @@
         <input type="range" id="s-emit" min="4" max="256" step="4"></label>
       <small>body / water / size rebuild the scene on release</small>
     </div>
-    <div id="hint"></div>
+    <div id="hint">🔪 left-drag slices &nbsp;·&nbsp; 🚿 <b>shift</b>+left sprays
+      &nbsp;·&nbsp; 🖐 right-drag grabs &nbsp;·&nbsp; middle-drag orbits, wheel zooms</div>
   </div>
   <div id="stats"></div>
   <div id="loading">initializing WebGPU…</div>
