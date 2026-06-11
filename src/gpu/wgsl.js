@@ -6,6 +6,7 @@ export const makeShaderSource = (C) => /* wgsl */ `
 
 // ---- constants baked at pipeline creation ----
 const SOLID_N: u32 = ${C.SOLID_N}u;
+const N_DIM: u32 = ${C.SOLID_DIM}u;
 const MAX_FLUID: u32 = ${C.MAX_FLUID}u;
 const TOTAL: u32 = ${C.TOTAL}u;
 const TABLE: u32 = ${C.TABLE}u;          // hash table size (pow2)
@@ -53,8 +54,13 @@ struct Params {
 
   frictionFluid: f32,
   grabK: f32,
+  sleepSpeed: f32,      // solids below this speed are put to rest
+  spacing: f32,
+
   emitCount: u32,
   emitStart: u32,
+  solidViscosity: f32,  // bonded-velocity smoothing (damps internal jiggle)
+  pad1: u32,
 
   emitPos: vec4f,       // xyz + speed in w
   emitDir: vec4f,       // xyz + phase in w
@@ -288,9 +294,13 @@ fn solidSolve(@builtin(global_invocation_id) g: vec3u) {
   let wi = effInvMass(i);
   let alpha = P.compliance / (P.h * P.h);
   var corr = vec3f(0.0);
-  var cnt = 0.0;
   let start = adj[i];
   let end = adj[i + 1u];
+  // each PAIR is scaled by 1/max(deg_i, deg_j) — both endpoints use the same
+  // factor, so Newton's third law holds exactly. Dividing by each particle's
+  // own count instead (classic Jacobi averaging) silently injects momentum
+  // at every irregular surface, making torn fragments "dance" forever.
+  let degI = end - start;
   for (var k = start; k < end; k++) {
     let ci = adj[SOLID_N + 1u + k];
     let c = cons[ci];
@@ -300,33 +310,57 @@ fn solidSolve(@builtin(global_invocation_id) g: vec3u) {
     let dd = pi - pos[other].xyz;
     let d = length(dd);
     if (d < 1e-9) { continue; }
-    // ripping: bond breaks when the gap opens past tearGap diameters,
-    // regardless of rest length (also cleans up strands the slicer missed)
-    if (d > rest + P.tearGap * 2.0 * P.solidRadius) { cons[ci].w = 0u; continue; }
     let wo = effInvMass(other);
     let wsum = wi + wo;
     if (wsum == 0.0) { continue; }
-    let C = d - rest;
-    let dl = -C / (wsum + alpha);
-    corr += dd * (dl * wi / d);
-    cnt += 1.0;
-    // plasticity: permanent dents (same value written from both ends)
-    let strain = C / rest;
-    if (abs(strain) > P.plasticThreshold) {
-      cons[ci].z = bitcast<u32>(rest + C * P.plasticRate);
-    }
+    let degJ = adj[other + 1u] - adj[other];
+    let s = 1.0 / f32(max(degI, degJ));
+    let dl = -(d - rest) / (wsum + alpha);
+    corr += dd * (dl * wi / d * s);
   }
-  delta[i] = vec4f(corr, cnt);
+  delta[i] = vec4f(corr, 1.0);
 }
 
 @compute @workgroup_size(256)
 fn applyDeltaSolid(@builtin(global_invocation_id) g: vec3u) {
   let i = g.x;
   if (i >= SOLID_N || (flags[i] & F_ACTIVE) == 0u) { return; }
-  let d = delta[i];
-  if (d.w > 0.0) {
-    pos[i] = vec4f(pos[i].xyz + d.xyz * (P.omega / d.w), pos[i].w);
-  }
+  pos[i] = vec4f(pos[i].xyz + delta[i].xyz * P.omega, pos[i].w);
+}
+
+// ============ bond update: tearing + plasticity ============
+// Runs once per substep in constraint space, AFTER the solve iterations.
+// Doing this inside the solve gather raced: one endpoint could tear a bond
+// while the other still applied its correction — a one-sided impulse that
+// pumped momentum into ripped fragments.
+fn latticeRest(a: u32, b: u32) -> f32 {
+  let ax = f32(a / (N_DIM * N_DIM)); let ay = f32((a / N_DIM) % N_DIM); let az = f32(a % N_DIM);
+  let bx = f32(b / (N_DIM * N_DIM)); let by = f32((b / N_DIM) % N_DIM); let bz = f32(b % N_DIM);
+  let dx = ax - bx; let dy = ay - by; let dz = az - bz;
+  return P.spacing * sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+@compute @workgroup_size(256)
+fn bondUpdate(@builtin(global_invocation_id) g: vec3u) {
+  let ci = g.x;
+  if (ci >= NUM_CONS) { return; }
+  let c = cons[ci];
+  if (c.w == 0u) { return; }
+  let d = distance(pos[c.x].xyz, pos[c.y].xyz);
+  let rest = bitcast<f32>(c.z);
+  // ripping: bond breaks when the gap opens past tearGap diameters
+  if (d > rest + P.tearGap * 2.0 * P.solidRadius) { cons[ci].w = 0u; return; }
+  // plasticity, clamped tightly around the pristine lattice rest. A wide
+  // band lets neighboring bonds creep to geometrically incompatible rests —
+  // the solver then can never converge and its per-substep residual churn
+  // becomes perpetual kinetic energy ("dancing" fragments). The clamp is
+  // enforced every substep so corrupted states heal themselves.
+  let strain = (d - rest) / rest;
+  var nr = rest;
+  if (abs(strain) > P.plasticThreshold) { nr = rest + (d - rest) * P.plasticRate; }
+  let r0 = latticeRest(c.x, c.y);
+  nr = clamp(nr, 0.9 * r0, 1.25 * r0);
+  if (nr != rest) { cons[ci].z = bitcast<u32>(nr); }
 }
 
 // ============ contacts: solid-solid (non-bonded) + solid-fluid ============
@@ -362,7 +396,11 @@ fn contacts(@builtin(global_invocation_id) g: vec3u) {
       if (!iSolid && !jSolid) { continue; } // fluid-fluid handled by DDR
       let dd = pi - pos[j].xyz;
       let rj = select(P.fluidRadius, P.solidRadius, jSolid);
-      let rsum = ri + rj;
+      // solid-solid contacts use a reduced radius so that a freshly cut
+      // face (particles at lattice spacing, no longer bonded) is a valid
+      // rest state — otherwise contacts and constraints fight forever
+      var rsum = ri + rj;
+      if (iSolid && jSolid) { rsum = min(rsum, P.spacing * 0.97); }
       let d2 = dot(dd, dd);
       if (d2 >= rsum * rsum || d2 < 1e-12) { continue; }
       if (iSolid && jSolid && isBonded(i, j)) { continue; }
@@ -370,7 +408,9 @@ fn contacts(@builtin(global_invocation_id) g: vec3u) {
       let wsum = wi + wj;
       if (wsum == 0.0) { continue; }
       let d = sqrt(d2);
-      corr += dd * ((rsum - d) / d * wi / wsum);
+      // fixed 0.5 pair scale (NOT averaged by own count) — both sides of a
+      // contact must apply the same factor or momentum is not conserved
+      corr += dd * ((rsum - d) / d * wi / wsum * 0.5);
       cnt += 1.0;
     }
   }}}
@@ -381,10 +421,13 @@ fn contacts(@builtin(global_invocation_id) g: vec3u) {
 fn applyDeltaAll(@builtin(global_invocation_id) g: vec3u) {
   let i = g.x;
   if (i >= TOTAL || (flags[i] & F_ACTIVE) == 0u) { return; }
-  let d = delta[i];
-  if (d.w > 0.0) {
-    pos[i] = vec4f(pos[i].xyz + d.xyz / max(d.w, 1.0), pos[i].w);
-  }
+  var d = delta[i].xyz;
+  // safety clamp for pathological stacking (slightly breaks symmetry, but
+  // only in extremes where stability matters more)
+  let r = select(P.fluidRadius, P.solidRadius, i < SOLID_N);
+  let m2 = dot(d, d);
+  if (m2 > 0.25 * r * r) { d *= 0.5 * r / sqrt(m2); }
+  pos[i] = vec4f(pos[i].xyz + d, pos[i].w);
 }
 
 // ============ bounds ============
@@ -398,10 +441,27 @@ fn bounds(@builtin(global_invocation_id) g: vec3u) {
   let r = select(P.fluidRadius, P.solidRadius, iSolid);
 
   if (p.y < r) {
+    let pen = r - p.y;
     p.y = r;
-    let mu = select(P.frictionFluid, P.frictionSolid, iSolid);
-    p.x -= (p.x - pv.x) * mu;
-    p.z -= (p.z - pv.z) * mu;
+    if (iSolid) {
+      // Coulomb friction: stick when the tangential step fits in the cone,
+      // otherwise slide decelerated — lets resting pieces actually rest
+      let tx = p.x - pv.x;
+      let tz = p.z - pv.z;
+      let tl = sqrt(tx * tx + tz * tz);
+      let maxSlide = P.frictionSolid * pen;
+      if (tl <= maxSlide || tl < 1e-9) {
+        p.x = pv.x;
+        p.z = pv.z;
+      } else {
+        let s = maxSlide / tl;
+        p.x -= tx * s;
+        p.z -= tz * s;
+      }
+    } else {
+      p.x -= (p.x - pv.x) * P.frictionFluid;
+      p.z -= (p.z - pv.z) * P.frictionFluid;
+    }
   }
 
   if (p.y < P.wallH + r) {
@@ -434,7 +494,53 @@ fn velocityUpdate(@builtin(global_invocation_id) g: vec3u) {
   v *= max(0.0, 1.0 - damp * P.h);
   let sp2 = dot(v, v);
   if (sp2 > P.maxSpeed * P.maxSpeed) { v *= P.maxSpeed / sqrt(sp2); }
+  // sleep: solver residual jitter on resting solids otherwise rectifies into
+  // perpetual crawling. Counter-based: only sustained low speed sleeps, so a
+  // free-falling body (speed grows every substep) never triggers it, and a
+  // contact disturbance (e.g. water pushing) wakes the particle up.
+  // density[i].x is unused for solids and serves as the sleep counter.
+  if (i < SOLID_N) {
+    var cnt = density[i].x;
+    let d = delta[i]; // last contacts-pass result for this particle
+    let disturbed = d.w > 0.0 &&
+      dot(d.xyz, d.xyz) > 0.0009 * P.solidRadius * P.solidRadius;
+    if (sp2 < P.sleepSpeed * P.sleepSpeed && !disturbed) { cnt += 1.0; } else { cnt = 0.0; }
+    if (cnt > 20.0) { v = vec3f(0.0); }
+    density[i] = vec2f(min(cnt, 1000.0), 0.0);
+  }
   vel[i] = vec4f(v, 0.0);
+}
+
+// ============ bonded-velocity smoothing (solids) ============
+// XSPH over alive bonds: blends each particle's velocity toward its bonded
+// neighborhood average. Damps internal oscillation modes (which the speed
+// clamp otherwise sustains forever in ripped fragments) without touching
+// positions — volume and rigid translation are preserved.
+@compute @workgroup_size(256)
+fn solidVisc(@builtin(global_invocation_id) g: vec3u) {
+  let i = g.x;
+  if (i >= SOLID_N || (flags[i] & F_ACTIVE) == 0u) { return; }
+  var sum = vec3f(0.0);
+  var m = 0.0;
+  let start = adj[i];
+  let end = adj[i + 1u];
+  for (var k = start; k < end; k++) {
+    let c = cons[adj[SOLID_N + 1u + k]];
+    if (c.w == 0u) { continue; }
+    let other = select(c.x, c.y, c.x == i);
+    sum += vel[other].xyz;
+    m += 1.0;
+  }
+  var v = vel[i].xyz;
+  if (m > 0.0) { v += P.solidViscosity * (sum / m - v); }
+  delta[i] = vec4f(v, 0.0);
+}
+
+@compute @workgroup_size(256)
+fn solidViscApply(@builtin(global_invocation_id) g: vec3u) {
+  let i = g.x;
+  if (i >= SOLID_N || (flags[i] & F_ACTIVE) == 0u) { return; }
+  vel[i] = vec4f(delta[i].xyz, 0.0);
 }
 
 // ============ XSPH viscosity (fluid) ============

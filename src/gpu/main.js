@@ -294,9 +294,24 @@ async function init() {
     e.preventDefault();
   }, { passive: false });
 
+  let snapBusy = false;
+  async function saveSnapshot() {
+    if (snapBusy) return;
+    snapBusy = true;
+    const snap = await sim.snapshot();
+    const blob = new Blob([JSON.stringify(snap)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `splash-snapshot-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    snapBusy = false;
+  }
+
   addEventListener('keydown', (e) => {
     if (e.key === 'r' || e.key === 'R') sim.resetSolid();
     if (e.key === 'c' || e.key === 'C') sim.clearFluid();
+    if (e.code === 'Space') { e.preventDefault(); saveSnapshot(); }
   });
   $('reset').addEventListener('click', () => sim.resetSolid());
   $('drain').addEventListener('click', () => sim.clearFluid());
@@ -366,6 +381,23 @@ async function init() {
   // ---- test/tuning hooks ----
   window.__sim = {
     sim, renderer, camera,
+    // load a Space-key snapshot file's parsed JSON for exact-state repro
+    loadSnapshot(snap) {
+      pointerDown = false;
+      spraying = false;
+      lastGrabPoint = null;
+      grabButton = null;
+      const old = sim;
+      sim = new GpuSim(device, snap.opts);
+      renderer.attachSim(sim);
+      old.dispose();
+      sim.restore(snap);
+      $('s-dim').value = snap.opts.SOLID_DIM;
+      $('s-fluid').value = Math.round(Math.log2(snap.opts.MAX_FLUID));
+      $('s-size').value = Math.round(snap.opts.params.solidRadius * 1000);
+      updateLabels();
+      window.__sim.sim = sim;
+    },
     pause: (v) => { paused = v; },
     setParam: (k, v) => { sim.o.params[k] = v; },
     spray: (on) => { spraying = on; hoseTarget.set(1.5, 0, 1.5); },

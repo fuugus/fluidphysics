@@ -1,5 +1,19 @@
 import { makeShaderSource } from './wgsl.js';
 
+const b64encode = (buf) => {
+  const u8 = new Uint8Array(buf);
+  let s = '';
+  for (let i = 0; i < u8.length; i += 0x8000)
+    s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+  return btoa(s);
+};
+const b64decode = (s) => {
+  const bin = atob(s);
+  const u8 = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  return u8.buffer;
+};
+
 // GPU port of the unified particle solver. All state lives in GPU buffers;
 // the CPU only encodes passes and feeds small uniforms (tools, emitter).
 
@@ -40,16 +54,19 @@ export const DEFAULTS = {
     cullR: 7.0,
     dampSolid: 1.2,
     dampFluid: 0.6,
-    frictionSolid: 0.4,
+    frictionSolid: 0.35,
     frictionFluid: 0.04,
     grabK: 0.3,
+    sleepSpeed: 0.05,
+    solidViscosity: 0.15,
   },
 };
 
 const KERNELS = [
   'integrate', 'gridClear', 'gridCount', 'scanBlocks', 'scanPartials', 'scanApply',
-  'gridScatter', 'fluidDensity', 'fluidDisp', 'applyDeltaFluid', 'solidSolve',
+  'gridScatter', 'fluidDensity', 'fluidDisp', 'applyDeltaFluid', 'solidSolve', 'bondUpdate',
   'applyDeltaSolid', 'contacts', 'applyDeltaAll', 'bounds', 'velocityUpdate',
+  'solidVisc', 'solidViscApply',
   'xsph', 'xsphApply', 'emit', 'cut', 'pick', 'grabSelect', 'grabRelease', 'countActive',
 ];
 
@@ -153,7 +170,7 @@ export class GpuSim {
       adj: mk((this.SOLID_N + 1 + 2 * this.NUM_CONS) * 4),
       gridA: mk((TABLE * 2 + N + 8) * 4),
       gridS: mk((TABLE + 1 + TABLE / 256) * 4),
-      params: d.createBuffer({ size: 288, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }),
+      params: d.createBuffer({ size: 304, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }),
     };
     this.staging = {
       pick: d.createBuffer({ size: 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ }),
@@ -162,7 +179,7 @@ export class GpuSim {
     };
 
     const code = makeShaderSource({
-      SOLID_N: this.SOLID_N, MAX_FLUID, TOTAL: N, TABLE,
+      SOLID_N: this.SOLID_N, SOLID_DIM: this.o.SOLID_DIM, MAX_FLUID, TOTAL: N, TABLE,
       NUM_CONS: this.NUM_CONS, SCAN_BLOCKS: TABLE / 256,
     });
     const module = d.createShaderModule({ code });
@@ -188,7 +205,7 @@ export class GpuSim {
     });
 
     // params CPU mirror
-    this.paramsBuf = new ArrayBuffer(288);
+    this.paramsBuf = new ArrayBuffer(304);
     this.pf = new Float32Array(this.paramsBuf);
     this.pu = new Uint32Array(this.paramsBuf);
 
@@ -203,6 +220,8 @@ export class GpuSim {
     q.writeBuffer(this.buf.vel, 0, new Float32Array(this.TOTAL * 4));
     q.writeBuffer(this.buf.flags, 0, this.init.flags.slice(0, this.SOLID_N), 0);
     q.writeBuffer(this.buf.cons, 0, this.init.cons);
+    // clear solid sleep counters so the fresh cube doesn't spawn asleep
+    q.writeBuffer(this.buf.density, 0, new Float32Array(this.SOLID_N * 2));
   }
 
   clearFluid() {
@@ -220,24 +239,25 @@ export class GpuSim {
       p.plasticThreshold, p.plasticRate, p.tearGap, p.maxSpeed,
       p.wallX, p.wallZ, p.wallH, p.wallT,
       p.cullR, p.dampSolid, p.dampFluid, p.frictionSolid,
-      p.frictionFluid, p.grabK,
+      p.frictionFluid, p.grabK, p.sleepSpeed, this.o.spacing,
     ];
     pf.set(scalars, 0);
-    pu[26] = pend.emitCount;
-    pu[27] = pend.emitStart || 0;
+    pu[28] = pend.emitCount;
+    pu[29] = pend.emitStart || 0;
+    pf[30] = p.solidViscosity;
     const v4 = (o, arr) => pf.set(arr, o);
-    v4(28, pend.emitPos || [0, 0, 0, 0]);
-    v4(32, pend.emitDir || [0, 0, 0, 0]);
-    v4(36, pend.emitSide || [0, 0, 0, 0]);
-    v4(40, pend.emitUp || [0, 0, 0, 0]);
+    v4(32, pend.emitPos || [0, 0, 0, 0]);
+    v4(36, pend.emitDir || [0, 0, 0, 0]);
+    v4(40, pend.emitSide || [0, 0, 0, 0]);
+    v4(44, pend.emitUp || [0, 0, 0, 0]);
     const gd = pend.grabDelta;
-    v4(44, [gd[0] / this.substeps, gd[1] / this.substeps, gd[2] / this.substeps, 0]);
-    v4(48, pend.cutO || [0, 0, 0, 0]);
-    v4(52, pend.cutD1 || [0, 0, 0, 0]);
-    v4(56, pend.cutD2 || [0, 0, 0, 0]);
-    v4(60, pend.pickO || [0, 0, 0, 0.25]);
-    v4(64, pend.pickD || [0, 0, 1, 0]);
-    v4(68, pend.grabC || [0, 0, 0, 0]);
+    v4(48, [gd[0] / this.substeps, gd[1] / this.substeps, gd[2] / this.substeps, 0]);
+    v4(52, pend.cutO || [0, 0, 0, 0]);
+    v4(56, pend.cutD1 || [0, 0, 0, 0]);
+    v4(60, pend.cutD2 || [0, 0, 0, 0]);
+    v4(64, pend.pickO || [0, 0, 0, 0.25]);
+    v4(68, pend.pickD || [0, 0, 1, 0]);
+    v4(72, pend.grabC || [0, 0, 0, 0]);
     this.device.queue.writeBuffer(this.buf.params, 0, this.paramsBuf);
   }
 
@@ -277,10 +297,13 @@ export class GpuSim {
         run('solidSolve', wg(this.SOLID_N));
         run('applyDeltaSolid', wg(this.SOLID_N));
       }
+      run('bondUpdate', wg(this.NUM_CONS));
       run('contacts', wg(this.TOTAL));
       run('applyDeltaAll', wg(this.TOTAL));
       run('bounds', wg(this.TOTAL));
       run('velocityUpdate', wg(this.TOTAL));
+      run('solidVisc', wg(this.SOLID_N));
+      run('solidViscApply', wg(this.SOLID_N));
       run('xsph', wg(this.o.MAX_FLUID));
       run('xsphApply', wg(this.o.MAX_FLUID));
     }
@@ -372,6 +395,53 @@ export class GpuSim {
     this._countBusy = false;
     this._lastCount = n;
     return n;
+  }
+
+  async _readBuffer(buf, size) {
+    const st = this.device.createBuffer({ size, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const enc = this.device.createCommandEncoder();
+    enc.copyBufferToBuffer(buf, 0, st, 0, size);
+    this.device.queue.submit([enc.finish()]);
+    await st.mapAsync(GPUMapMode.READ);
+    const data = st.getMappedRange().slice(0);
+    st.destroy();
+    return data;
+  }
+
+  // full sim state → JSON-serializable object (Space key downloads this; a
+  // saved file can be fed back via window.__sim.loadSnapshot for exact repro)
+  async snapshot() {
+    const N = this.TOTAL;
+    const read = (name, size) => this._readBuffer(this.buf[name], size).then(b64encode);
+    return {
+      version: 1,
+      app: 'slice-splash-gpu',
+      opts: { ...this.o, params: { ...this.o.params } },
+      fluidNext: this.fluidNext,
+      numCons: this.NUM_CONS,
+      buffers: {
+        pos: await read('pos', N * 16),
+        prev: await read('prev', N * 16),
+        vel: await read('vel', N * 16),
+        flags: await read('flags', N * 4),
+        density: await read('density', N * 8),
+        cons: await read('cons', this.NUM_CONS * 16),
+      },
+    };
+  }
+
+  restore(snap) {
+    const q = this.device.queue;
+    for (const [name, data] of Object.entries(snap.buffers)) {
+      const buf = b64decode(data);
+      if (name === 'flags') {
+        // clear grab bits — the snapshot may have been taken mid-grab
+        const f = new Uint32Array(buf);
+        for (let i = 0; i < f.length; i++) f[i] &= ~2;
+      }
+      q.writeBuffer(this.buf[name], 0, buf);
+    }
+    this.fluidNext = snap.fluidNext;
   }
 
   dispose() {
