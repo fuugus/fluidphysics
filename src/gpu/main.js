@@ -21,14 +21,80 @@ async function init() {
   device.lost.then((l) => console.error('WebGPU device LOST:', l.reason, l.message));
 
   const canvas = $('view');
-  // scale knobs: ?fluid=262144&dim=24&emit=120
+  // initial scale knobs: ?fluid=262144&dim=24&emit=120&size=40 (radius in mm)
   const q = new URLSearchParams(location.search);
-  const MAX_FLUID = Math.min(1 << 20, parseInt(q.get('fluid')) || 65536);
-  const SOLID_DIM = Math.min(32, parseInt(q.get('dim')) || 20);
-  const TABLE = Math.max(1 << 18,
-    1 << Math.ceil(Math.log2(2 * (MAX_FLUID + SOLID_DIM ** 3))));
-  const sim = new GpuSim(device, { MAX_FLUID, SOLID_DIM, TABLE });
+
+  // one particle radius drives both body and water (for now); everything
+  // length-dependent in the solver is derived from it
+  function deriveOpts(dim, maxFluid, radiusMm) {
+    const r = radiusMm / 1000;
+    const H = 2.6 * r;
+    const spacing = 1.91 * r;
+    return {
+      SOLID_DIM: dim,
+      MAX_FLUID: maxFluid,
+      TABLE: Math.max(1 << 18, 1 << Math.ceil(Math.log2(2 * (maxFluid + dim ** 3)))),
+      spacing,
+      solidMass: 100 * r ** 3,   // ~8x fluid density, matches original feel
+      fluidMass: 12 * r ** 3,
+      cubeCenter: [0, (dim - 1) * spacing / 2 + 0.5, 0],
+      params: {
+        solidRadius: r,
+        fluidRadius: r,
+        fluidH: H,
+        cellSize: H,
+        stiffness: 0.0015 * (H / 0.13),     // pressure displacement scales with H
+        nearStiffness: 0.006 * (H / 0.13),
+      },
+    };
+  }
+
+  // ---- UI sliders ----
+  const ui = {
+    dim: Math.min(32, parseInt(q.get('dim')) || 20),
+    fluidExp: Math.round(Math.log2(Math.min(1 << 20, parseInt(q.get('fluid')) || 65536))),
+    sizeMm: Math.min(80, Math.max(20, parseInt(q.get('size')) || 40)),
+    emit: Math.min(256, parseInt(q.get('emit')) || 28),
+  };
+  const fmt = {
+    dim: (v) => `${v}³ = ${(v ** 3).toLocaleString()}`,
+    fluid: (v) => (1 << v).toLocaleString(),
+    size: (v) => `${v} mm`,
+    emit: (v) => `${v}/frame`,
+  };
+  $('s-dim').value = ui.dim;
+  $('s-fluid').value = ui.fluidExp;
+  $('s-size').value = ui.sizeMm;
+  $('s-emit').value = ui.emit;
+  const updateLabels = () => {
+    $('v-dim').textContent = fmt.dim(+$('s-dim').value);
+    $('v-fluid').textContent = fmt.fluid(+$('s-fluid').value);
+    $('v-size').textContent = fmt.size(+$('s-size').value);
+    $('v-emit').textContent = fmt.emit(+$('s-emit').value);
+  };
+  updateLabels();
+
+  let sim = new GpuSim(device, deriveOpts(ui.dim, 1 << ui.fluidExp, ui.sizeMm));
   const renderer = new Renderer(device, canvas, sim);
+
+  function rebuild() {
+    ui.dim = +$('s-dim').value;
+    ui.fluidExp = +$('s-fluid').value;
+    ui.sizeMm = +$('s-size').value;
+    pointerDown = false;
+    spraying = false;
+    lastGrabPoint = null;
+    const old = sim;
+    sim = new GpuSim(device, deriveOpts(ui.dim, 1 << ui.fluidExp, ui.sizeMm));
+    renderer.attachSim(sim);
+    old.dispose();
+    if (window.__sim) window.__sim.sim = sim;
+  }
+  for (const id of ['s-dim', 's-fluid', 's-size']) {
+    $(id).addEventListener('input', updateLabels);
+    $(id).addEventListener('change', rebuild);
+  }
+  $('s-emit').addEventListener('input', () => { updateLabels(); ui.emit = +$('s-emit').value; });
 
   // ---- timestamps ----
   let ts = null;
@@ -224,7 +290,6 @@ async function init() {
   addEventListener('resize', updateCamera);
 
   // ---- hose emission ----
-  const EMIT_PER_FRAME = Math.min(256, parseInt(q.get('emit')) || 28);
   const NOZZLE_SPEED = 7.5;
   function sprayStep() {
     const dir = hoseTarget.clone().sub(hosePos).normalize();
@@ -234,9 +299,9 @@ async function init() {
     const side = new THREE.Vector3().crossVectors(dir, new THREE.Vector3(0, 1, 0)).normalize();
     const up = new THREE.Vector3().crossVectors(side, dir).normalize();
     const tip = hosePos.clone().addScaledVector(dir, 0.6);
-    sim.emit(EMIT_PER_FRAME, [tip.x, tip.y, tip.z], [dir.x, dir.y, dir.z],
+    sim.emit(ui.emit, [tip.x, tip.y, tip.z], [dir.x, dir.y, dir.z],
       [side.x, side.y, side.z], [up.x, up.y, up.z], NOZZLE_SPEED, sprayPhase);
-    sprayPhase = (sprayPhase + EMIT_PER_FRAME * 2.39996) % (Math.PI * 2);
+    sprayPhase = (sprayPhase + ui.emit * 2.39996) % (Math.PI * 2);
   }
 
   // ---- main loop ----
@@ -278,7 +343,7 @@ async function init() {
         $('stats').textContent =
           `${fps} fps · ${sim.SOLID_N.toLocaleString()} body + ${n.toLocaleString()} water` +
           (ts ? ` · sim ${ts.compute.toFixed(1)}ms · draw ${ts.render.toFixed(1)}ms` : '');
-      });
+      }).catch(() => {}); // staging buffer may be destroyed by a rebuild mid-read
     }
   }
   requestAnimationFrame(frame);

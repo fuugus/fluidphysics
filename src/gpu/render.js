@@ -125,7 +125,6 @@ export class Renderer {
   constructor(device, canvas, sim) {
     this.device = device;
     this.canvas = canvas;
-    this.sim = sim;
     this.format = navigator.gpu.getPreferredCanvasFormat();
     this.ctx = canvas.getContext('webgpu');
     this.ctx.configure({ device, format: this.format, alphaMode: 'opaque' });
@@ -135,7 +134,43 @@ export class Renderer {
 
     this._buildPipelines();
     this.objects = [];
+    this.attachSim(sim);
     this._resize();
+  }
+
+  // (re)bind particle buffers + materials; called again after a sim rebuild
+  attachSim(sim) {
+    const d = this.device;
+    this.sim = sim;
+    this.impCamBG = d.createBindGroup({
+      layout: this.impCamBGL,
+      entries: [
+        { binding: 0, resource: { buffer: this.camUB } },
+        { binding: 1, resource: { buffer: sim.buf.pos } },
+        { binding: 2, resource: { buffer: sim.buf.flags } },
+      ],
+    });
+    if (this.materials) for (const m of Object.values(this.materials)) m.ub.destroy();
+    this.materials = {};
+    for (const [name, color, radius, base, count, shiny, fresnel] of [
+      ['jelly', [0.88, 0.12, 0.2], sim.o.params.solidRadius * 2.0, 0, sim.SOLID_N, 0.9, 0.5],
+      ['water', [0.15, 0.5, 0.92], sim.o.params.fluidRadius * 1.8, sim.SOLID_N, sim.o.MAX_FLUID, 1.2, 0.9],
+    ]) {
+      const ub = d.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      const data = new ArrayBuffer(48);
+      const f = new Float32Array(data);
+      const u = new Uint32Array(data);
+      f.set([...color, 1], 0);
+      f[4] = radius;
+      u[5] = base;
+      f[6] = shiny;
+      f[7] = fresnel;
+      d.queue.writeBuffer(ub, 0, data);
+      this.materials[name] = {
+        count, ub,
+        bg: d.createBindGroup({ layout: this.matBGL, entries: [{ binding: 0, resource: { buffer: ub } }] }),
+      };
+    }
   }
 
   _buildPipelines() {
@@ -196,36 +231,6 @@ export class Renderer {
       layout: this.camBGL,
       entries: [{ binding: 0, resource: { buffer: this.camUB } }],
     });
-    this.impCamBG = d.createBindGroup({
-      layout: this.impCamBGL,
-      entries: [
-        { binding: 0, resource: { buffer: this.camUB } },
-        { binding: 1, resource: { buffer: this.sim.buf.pos } },
-        { binding: 2, resource: { buffer: this.sim.buf.flags } },
-      ],
-    });
-
-    // particle material uniforms
-    this.materials = {};
-    for (const [name, color, radius, base, count, shiny, fresnel] of [
-      ['jelly', [0.88, 0.12, 0.2], this.sim.o.params.solidRadius * 2.0, 0, this.sim.SOLID_N, 0.9, 0.5],
-      ['water', [0.15, 0.5, 0.92], this.sim.o.params.fluidRadius * 1.8, this.sim.SOLID_N, this.sim.o.MAX_FLUID, 1.2, 0.9],
-    ]) {
-      const ub = d.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-      const data = new ArrayBuffer(48);
-      const f = new Float32Array(data);
-      const u = new Uint32Array(data);
-      f.set([...color, 1], 0);
-      f[4] = radius;
-      u[5] = base;
-      f[6] = shiny;
-      f[7] = fresnel;
-      d.queue.writeBuffer(ub, 0, data);
-      this.materials[name] = {
-        count,
-        bg: d.createBindGroup({ layout: this.matBGL, entries: [{ binding: 0, resource: { buffer: ub } }] }),
-      };
-    }
   }
 
   // ---- environment objects from three.js geometries ----

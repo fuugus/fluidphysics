@@ -374,6 +374,11 @@ export class GpuSim {
     return n;
   }
 
+  dispose() {
+    for (const b of Object.values(this.buf)) b.destroy();
+    for (const b of Object.values(this.staging)) b.destroy();
+  }
+
   // count alive constraints (test/debug)
   async readConsAlive() {
     const enc = this.device.createCommandEncoder();
