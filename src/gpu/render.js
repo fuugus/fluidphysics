@@ -202,7 +202,7 @@ export class Renderer {
     });
 
     const meshMod = d.createShaderModule({ code: MESH_WGSL });
-    const meshDesc = (blend, depthWrite) => ({
+    const meshDesc = (blend, depthWrite, depthCompare = 'less') => ({
       layout: d.createPipelineLayout({ bindGroupLayouts: [this.camBGL, this.matBGL] }),
       vertex: {
         module: meshMod, entryPoint: 'vs',
@@ -213,7 +213,7 @@ export class Renderer {
       },
       fragment: { module: meshMod, entryPoint: 'fs', targets: [{ format: this.format, ...(blend && { blend }) }] },
       primitive: { topology: 'triangle-list', cullMode: 'none' },
-      depthStencil: { format: depthFmt, depthWriteEnabled: depthWrite, depthCompare: 'less' },
+      depthStencil: { format: depthFmt, depthWriteEnabled: depthWrite, depthCompare },
     });
     this.meshPipe = d.createRenderPipeline(meshDesc(null, true));
     const alphaBlend = {
@@ -225,7 +225,7 @@ export class Renderer {
       color: { srcFactor: 'one', dstFactor: 'one' },
       alpha: { srcFactor: 'one', dstFactor: 'one' },
     };
-    this.trailPipe = d.createRenderPipeline(meshDesc(addBlend, false));
+    this.trailPipe = d.createRenderPipeline(meshDesc(addBlend, false, 'always')); // helper overlay
 
     this.camBG = d.createBindGroup({
       layout: this.camBGL,

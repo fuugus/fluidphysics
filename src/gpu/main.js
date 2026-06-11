@@ -84,6 +84,7 @@ async function init() {
     pointerDown = false;
     spraying = false;
     lastGrabPoint = null;
+    grabButton = null;
     const old = sim;
     sim = new GpuSim(device, deriveOpts(ui.dim, 1 << ui.fluidExp, ui.sizeMm));
     renderer.attachSim(sim);
@@ -147,22 +148,48 @@ async function init() {
     { color: [0.83, 0.63, 0.09] });
   const hosePos = new THREE.Vector3(-3.1, 1.55, -3.1);
 
-  const knife = renderer.addMesh(new THREE.BoxGeometry(0.03, 0.9, 0.22).translate(0, 0.75, 0),
-    { color: [0.93, 0.95, 0.97] });
-  knife.visible = false;
-  const MAX_TRAIL = 64;
-  const trail = renderer.addDynamicMesh((MAX_TRAIL - 1) * 6,
-    { color: [0.5, 0.5, 0.55], alpha: 1, unlit: true, kind: 'trail' });
-  let trailPts = [];
-  function updateTrail() {
-    const n = Math.max(0, trailPts.length - 1);
-    const v = new Float32Array(n * 18);
+  // ---- swipe trail (fruit-ninja style): screen-space ribbon, each point
+  // fades by its own age — the tail dissolves first, the tip stays bright.
+  // Drawn via the WebGPU trail pipeline: trail points are unprojected to a
+  // fixed distance in front of the camera every frame, so it behaves like a
+  // 2D overlay (constant screen width, drawn over everything).
+  const MAX_SWIPE = 64;
+  const SWIPE_LIFE = 320; // ms
+  const SWIPE_DEPTH = 1.2; // m in front of the camera
+  const swipeMesh = renderer.addDynamicMesh((MAX_SWIPE - 1) * 6,
+    { color: [0.45, 0.55, 0.85], alpha: 1, unlit: true, kind: 'trail' });
+  let swipePts = []; // [{ x, y, t }] in client pixels
+  const _v = new THREE.Vector3();
+  function unprojectAtDepth(px, py, out) {
+    _v.set((px / innerWidth) * 2 - 1, -(py / innerHeight) * 2 + 1, 0.5).unproject(camera);
+    _v.sub(camera.position).normalize();
+    out.copy(camera.position).addScaledVector(_v, SWIPE_DEPTH);
+  }
+  function drawSwipe(now) {
+    if (swipePts.length === 0 && swipeMesh.count === 0) return;
+    swipePts = swipePts.filter((p) => now - p.t < SWIPE_LIFE);
+    if (swipePts.length > MAX_SWIPE) swipePts.splice(0, swipePts.length - MAX_SWIPE);
+    const n = Math.max(0, swipePts.length - 1);
+    const verts = new Float32Array(n * 18);
+    const e0 = new THREE.Vector3(), e1 = new THREE.Vector3(),
+          e2 = new THREE.Vector3(), e3 = new THREE.Vector3();
     for (let i = 0; i < n; i++) {
-      const a = trailPts[i], b = trailPts[i + 1];
-      v.set([a.x, 0.02, a.z, a.x, 2.0, a.z, b.x, 0.02, b.z,
-             a.x, 2.0, a.z, b.x, 2.0, b.z, b.x, 0.02, b.z], i * 18);
+      const a = swipePts[i], b = swipePts[i + 1];
+      // per-point width from each point's own age (tail tapers away)
+      const wa = (1 + 11 * Math.max(0, 1 - (now - a.t) / SWIPE_LIFE)) / 2;
+      const wb = (1 + 11 * Math.max(0, 1 - (now - b.t) / SWIPE_LIFE)) / 2;
+      // screen-space perpendicular
+      let dx = b.x - a.x, dy = b.y - a.y;
+      const len = Math.hypot(dx, dy) || 1;
+      dx /= len; dy /= len;
+      unprojectAtDepth(a.x - dy * wa, a.y + dx * wa, e0);
+      unprojectAtDepth(a.x + dy * wa, a.y - dx * wa, e1);
+      unprojectAtDepth(b.x - dy * wb, b.y + dx * wb, e2);
+      unprojectAtDepth(b.x + dy * wb, b.y - dx * wb, e3);
+      verts.set([e0.x, e0.y, e0.z, e1.x, e1.y, e1.z, e2.x, e2.y, e2.z,
+                 e1.x, e1.y, e1.z, e3.x, e3.y, e3.z, e2.x, e2.y, e2.z], i * 18);
     }
-    trail.update(v, n * 6);
+    swipeMesh.update(verts, n * 6);
   }
 
   // ---- tools ----
@@ -181,13 +208,12 @@ async function init() {
 
   function setTool(t) {
     tool = t;
-    knife.visible = t === 'slice';
     document.querySelectorAll('[data-tool]').forEach((b) =>
       b.classList.toggle('on', b.dataset.tool === t));
     $('hint').textContent = {
-      grab: 'Left-drag the cube to move it. Right-drag orbits, wheel zooms.',
-      slice: 'Left-drag a stroke across the cube to slice it. Repeatable.',
-      hose: 'Hold left mouse to spray water. Aim with the mouse.',
+      grab: 'Left- or right-drag the cube to move it. Middle-drag orbits, wheel zooms.',
+      slice: 'Left-drag a stroke across the cube — you cut what you see under it. Right-drag grabs, middle-drag orbits.',
+      hose: 'Hold left mouse to spray, aim with the mouse. Right-drag grabs, middle-drag orbits.',
     }[t];
     canvas.style.cursor = t === 'grab' ? 'grab' : 'crosshair';
   }
@@ -197,23 +223,31 @@ async function init() {
     ray.setFromCamera(ndc, camera);
   }
 
-  canvas.addEventListener('pointerdown', async (e) => {
-    if (e.button === 2) { orbiting = { x: e.clientX, y: e.clientY }; return; }
+  let grabButton = null; // which mouse button started the active grab
+  async function startGrab(e, button) {
+    grabButton = button;
+    updateRay(e);
+    const ro = ray.ray.origin, rd = ray.ray.direction;
+    const hit = await sim.pick([ro.x, ro.y, ro.z], [rd.x, rd.y, rd.z]);
+    if (!hit || grabButton !== button) return; // released during async pick
+    grabDepth = hit.t;
+    const p = ro.clone().addScaledVector(rd, hit.t);
+    lastGrabPoint = p.clone();
+    sim.grabAt([p.x, p.y, p.z], 0.3);
+    canvas.style.cursor = 'grabbing';
+  }
+
+  canvas.addEventListener('pointerdown', (e) => {
+    if (e.button === 1) { e.preventDefault(); orbiting = { x: e.clientX, y: e.clientY }; return; }
+    if (e.button === 2) { startGrab(e, 2); return; } // right = grab, any tool
     if (e.button !== 0) return;
     updateRay(e);
     pointerDown = true;
-    const ro = ray.ray.origin, rd = ray.ray.direction;
     if (tool === 'grab') {
-      const hit = await sim.pick([ro.x, ro.y, ro.z], [rd.x, rd.y, rd.z]);
-      if (!hit || !pointerDown) return;
-      grabDepth = hit.t;
-      const p = ro.clone().addScaledVector(rd, hit.t);
-      lastGrabPoint = p.clone();
-      sim.grabAt([p.x, p.y, p.z], 0.3);
-      canvas.style.cursor = 'grabbing';
+      startGrab(e, 0);
     } else if (tool === 'slice') {
-      prevRayDir = rd.clone();
-      trailPts = [];
+      prevRayDir = ray.ray.direction.clone();
+      swipePts.push({ x: e.clientX, y: e.clientY, t: performance.now() });
     } else if (tool === 'hose') {
       spraying = true;
     }
@@ -232,7 +266,7 @@ async function init() {
     const gp = new THREE.Vector3();
     ray.ray.intersectPlane(groundPlane, gp);
 
-    if (tool === 'grab' && pointerDown && lastGrabPoint) {
+    if (lastGrabPoint && grabButton !== null) {
       const p = ro.clone().addScaledVector(rd, grabDepth);
       p.y = Math.max(p.y, 0.12);
       const d = p.clone().sub(lastGrabPoint);
@@ -241,16 +275,11 @@ async function init() {
       sim.pending.grabDelta = [d.x, d.y, d.z];
       lastGrabPoint.add(d);
     } else if (tool === 'slice') {
-      if (gp) {
-        knife.matrix.setPosition(gp);
-        if (pointerDown && prevRayDir) {
-          sim.queueCut([ro.x, ro.y, ro.z],
-            [prevRayDir.x, prevRayDir.y, prevRayDir.z], [rd.x, rd.y, rd.z]);
-          prevRayDir.copy(rd);
-          trailPts.push(gp.clone());
-          if (trailPts.length > MAX_TRAIL) trailPts.shift();
-          updateTrail();
-        }
+      if (pointerDown && prevRayDir) {
+        sim.queueCut([ro.x, ro.y, ro.z],
+          [prevRayDir.x, prevRayDir.y, prevRayDir.z], [rd.x, rd.y, rd.z]);
+        prevRayDir.copy(rd);
+        swipePts.push({ x: e.clientX, y: e.clientY, t: performance.now() });
       }
     } else if (tool === 'hose' && gp) {
       hoseTarget.copy(gp);
@@ -259,14 +288,17 @@ async function init() {
 
   let orbiting = null;
   addEventListener('pointerup', (e) => {
-    if (e.button === 2) { orbiting = null; return; }
-    pointerDown = false;
-    spraying = false;
-    if (lastGrabPoint) { sim.release(); lastGrabPoint = null; }
-    prevRayDir = null;
-    trailPts = [];
-    updateTrail();
-    if (tool === 'grab') canvas.style.cursor = 'grab';
+    if (e.button === 1) { orbiting = null; return; }
+    if (e.button === grabButton) {
+      grabButton = null;
+      if (lastGrabPoint) { sim.release(); lastGrabPoint = null; }
+      canvas.style.cursor = tool === 'grab' ? 'grab' : 'crosshair';
+    }
+    if (e.button === 0) {
+      pointerDown = false;
+      spraying = false;
+      prevRayDir = null;
+    }
   });
   canvas.addEventListener('contextmenu', (e) => e.preventDefault());
   canvas.addEventListener('wheel', (e) => {
@@ -334,6 +366,7 @@ async function init() {
         });
       }
     }
+    drawSwipe(now);
     frames++;
     fpsT += dt;
     if (fpsT > 0.5) {
@@ -350,7 +383,7 @@ async function init() {
 
   // ---- test/tuning hooks ----
   window.__sim = {
-    sim, renderer,
+    sim, renderer, camera,
     pause: (v) => { paused = v; },
     setParam: (k, v) => { sim.o.params[k] = v; },
     spray: (on) => { spraying = on; hoseTarget.set(1.5, 0, 1.5); },
