@@ -54,11 +54,11 @@ export const DEFAULTS = {
     cullR: 7.0,
     dampSolid: 1.2,
     dampFluid: 0.6,
-    frictionSolid: 0.35,
+    frictionSolid: 0.4,
     frictionFluid: 0.04,
     grabK: 0.3,
-    sleepSpeed: 0.05,
-    solidViscosity: 0.15,
+    sleepSpeed: 0,      // band-aids, retired since the momentum fix —
+    solidViscosity: 0,  // params kept so they can be re-enabled for testing
   },
 };
 
@@ -220,7 +220,6 @@ export class GpuSim {
     q.writeBuffer(this.buf.vel, 0, new Float32Array(this.TOTAL * 4));
     q.writeBuffer(this.buf.flags, 0, this.init.flags.slice(0, this.SOLID_N), 0);
     q.writeBuffer(this.buf.cons, 0, this.init.cons);
-    // clear solid sleep counters so the fresh cube doesn't spawn asleep
     q.writeBuffer(this.buf.density, 0, new Float32Array(this.SOLID_N * 2));
   }
 
@@ -302,8 +301,10 @@ export class GpuSim {
       run('applyDeltaAll', wg(this.TOTAL));
       run('bounds', wg(this.TOTAL));
       run('velocityUpdate', wg(this.TOTAL));
-      run('solidVisc', wg(this.SOLID_N));
-      run('solidViscApply', wg(this.SOLID_N));
+      if (this.o.params.solidViscosity > 0) {
+        run('solidVisc', wg(this.SOLID_N));
+        run('solidViscApply', wg(this.SOLID_N));
+      }
       run('xsph', wg(this.o.MAX_FLUID));
       run('xsphApply', wg(this.o.MAX_FLUID));
     }

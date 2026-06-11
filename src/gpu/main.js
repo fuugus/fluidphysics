@@ -258,11 +258,11 @@ async function init() {
     if (lastGrabPoint && grabButton !== null) {
       const p = ro.clone().addScaledVector(rd, grabDepth);
       p.y = Math.max(p.y, 0.12);
-      const d = p.clone().sub(lastGrabPoint);
-      const MAX_DRAG = 0.08; // per frame — fast mouse can't teleport-stretch the body
-      if (d.length() > MAX_DRAG) d.setLength(MAX_DRAG);
-      sim.pending.grabDelta = [d.x, d.y, d.z];
-      lastGrabPoint.add(d);
+      const gd = sim.pending.grabDelta;
+      gd[0] += p.x - lastGrabPoint.x;
+      gd[1] += p.y - lastGrabPoint.y;
+      gd[2] += p.z - lastGrabPoint.z;
+      lastGrabPoint.copy(p);
     } else if (spraying && gp) {
       hoseTarget.copy(gp);
     } else if (pointerDown && prevRayDir) {

@@ -89,8 +89,10 @@ struct Params {
 @group(0) @binding(9) var<storage, read_write> gridS: array<u32>;     // scanned [TABLE+1] | block partials
 @group(0) @binding(10) var<uniform> P: Params;
 
+// grabbed particles keep their normal mass — the grab is a spring (applied
+// in integrate), not a kinematic pin, so held bodies dangle, swing, and can
+// be thrown, and ripping only happens from genuine overstretch
 fn effInvMass(i: u32) -> f32 {
-  if ((flags[i] & F_GRABBED) != 0u) { return 0.0; }
   return pos[i].w;
 }
 
@@ -109,17 +111,28 @@ fn integrate(@builtin(global_invocation_id) g: vec3u) {
   let i = g.x;
   if (i >= TOTAL || (flags[i] & F_ACTIVE) == 0u) { return; }
   var v = vel[i].xyz;
-  if ((flags[i] & F_GRABBED) == 0u) {
-    v.y += P.gravity * P.h;
-  } else {
-    v = vec3f(0.0);
-  }
+  v.y += P.gravity * P.h;
   let p = pos[i].xyz;
-  prev[i] = vec4f(p, 0.0);
   var np = p + v * P.h;
-  if ((flags[i] & F_GRABBED) != 0u) { np = p + P.grabDelta.xyz; }
+  var tw = prev[i].w;
+  if ((flags[i] & F_GRABBED) != 0u) {
+    // spring toward the grab target, which follows the mouse. The target is
+    // stashed in otherwise-unused w/x slots: (prev.w, vel.w, density.x)
+    var t = vec3f(prev[i].w, vel[i].w, density[i].x);
+    t += P.grabDelta.xyz;
+    var corr = (t - np) * P.grabK;
+    let cl = length(corr);
+    let maxC = 0.02; // caps follow speed — fast mouse stretches, not teleports
+    if (cl > maxC) { corr *= maxC / cl; }
+    np += corr;
+    tw = t.x;
+    vel[i] = vec4f(v, t.y);
+    density[i] = vec2f(t.z, density[i].y);
+  } else {
+    vel[i] = vec4f(v, vel[i].w);
+  }
+  prev[i] = vec4f(p, tw);
   pos[i] = vec4f(np, pos[i].w);
-  vel[i] = vec4f(v, 0.0);
 }
 
 // ============ grid build ============
@@ -441,27 +454,10 @@ fn bounds(@builtin(global_invocation_id) g: vec3u) {
   let r = select(P.fluidRadius, P.solidRadius, iSolid);
 
   if (p.y < r) {
-    let pen = r - p.y;
     p.y = r;
-    if (iSolid) {
-      // Coulomb friction: stick when the tangential step fits in the cone,
-      // otherwise slide decelerated — lets resting pieces actually rest
-      let tx = p.x - pv.x;
-      let tz = p.z - pv.z;
-      let tl = sqrt(tx * tx + tz * tz);
-      let maxSlide = P.frictionSolid * pen;
-      if (tl <= maxSlide || tl < 1e-9) {
-        p.x = pv.x;
-        p.z = pv.z;
-      } else {
-        let s = maxSlide / tl;
-        p.x -= tx * s;
-        p.z -= tz * s;
-      }
-    } else {
-      p.x -= (p.x - pv.x) * P.frictionFluid;
-      p.z -= (p.z - pv.z) * P.frictionFluid;
-    }
+    let mu = select(P.frictionFluid, P.frictionSolid, iSolid);
+    p.x -= (p.x - pv.x) * mu;
+    p.z -= (p.z - pv.z) * mu;
   }
 
   if (p.y < P.wallH + r) {
@@ -494,21 +490,7 @@ fn velocityUpdate(@builtin(global_invocation_id) g: vec3u) {
   v *= max(0.0, 1.0 - damp * P.h);
   let sp2 = dot(v, v);
   if (sp2 > P.maxSpeed * P.maxSpeed) { v *= P.maxSpeed / sqrt(sp2); }
-  // sleep: solver residual jitter on resting solids otherwise rectifies into
-  // perpetual crawling. Counter-based: only sustained low speed sleeps, so a
-  // free-falling body (speed grows every substep) never triggers it, and a
-  // contact disturbance (e.g. water pushing) wakes the particle up.
-  // density[i].x is unused for solids and serves as the sleep counter.
-  if (i < SOLID_N) {
-    var cnt = density[i].x;
-    let d = delta[i]; // last contacts-pass result for this particle
-    let disturbed = d.w > 0.0 &&
-      dot(d.xyz, d.xyz) > 0.0009 * P.solidRadius * P.solidRadius;
-    if (sp2 < P.sleepSpeed * P.sleepSpeed && !disturbed) { cnt += 1.0; } else { cnt = 0.0; }
-    if (cnt > 20.0) { v = vec3f(0.0); }
-    density[i] = vec2f(min(cnt, 1000.0), 0.0);
-  }
-  vel[i] = vec4f(v, 0.0);
+  vel[i] = vec4f(v, vel[i].w); // w carries the grab target's y component
 }
 
 // ============ bonded-velocity smoothing (solids) ============
@@ -540,7 +522,7 @@ fn solidVisc(@builtin(global_invocation_id) g: vec3u) {
 fn solidViscApply(@builtin(global_invocation_id) g: vec3u) {
   let i = g.x;
   if (i >= SOLID_N || (flags[i] & F_ACTIVE) == 0u) { return; }
-  vel[i] = vec4f(delta[i].xyz, 0.0);
+  vel[i] = vec4f(delta[i].xyz, vel[i].w);
 }
 
 // ============ XSPH viscosity (fluid) ============
@@ -649,6 +631,11 @@ fn grabSelect(@builtin(global_invocation_id) g: vec3u) {
   let dd = pos[i].xyz - P.grabC.xyz;
   if (dot(dd, dd) < P.grabC.w * P.grabC.w) {
     flags[i] |= F_GRABBED;
+    // initialize the spring target at the particle's current position
+    let p = pos[i].xyz;
+    prev[i] = vec4f(prev[i].xyz, p.x);
+    vel[i] = vec4f(vel[i].xyz, p.y);
+    density[i] = vec2f(p.z, density[i].y);
   }
 }
 
