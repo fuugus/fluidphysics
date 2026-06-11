@@ -14,7 +14,7 @@ export const DEFAULTS = {
   cubeCenter: [0, 1.8, 0],
 
   substeps: 5,
-  solidIters: 3,
+  solidIters: 6,
 
   params: {
     h: 1 / 300,

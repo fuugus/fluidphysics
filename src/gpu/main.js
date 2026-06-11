@@ -34,6 +34,9 @@ async function init() {
       SOLID_DIM: dim,
       MAX_FLUID: maxFluid,
       TABLE: Math.max(1 << 18, 1 << Math.ceil(Math.log2(2 * (maxFluid + dim ** 3)))),
+      // smaller particles need more substeps: per-substep penetration is an
+      // absolute distance, so the same impact means more strain at small scale
+      substeps: Math.min(10, Math.max(5, Math.round(0.2 / r))),
       spacing,
       solidMass: 100 * r ** 3,   // ~8x fluid density, matches original feel
       fluidMass: 12 * r ** 3,
@@ -53,7 +56,7 @@ async function init() {
   const ui = {
     dim: Math.min(32, parseInt(q.get('dim')) || 20),
     fluidExp: Math.round(Math.log2(Math.min(1 << 20, parseInt(q.get('fluid')) || 65536))),
-    sizeMm: Math.min(80, Math.max(20, parseInt(q.get('size')) || 40)),
+    sizeMm: Math.min(80, Math.max(20, parseInt(q.get('size')) || 30)),
     emit: Math.min(256, parseInt(q.get('emit')) || 28),
   };
   const fmt = {
@@ -110,7 +113,7 @@ async function init() {
 
   // ---- camera ----
   const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 100);
-  const orbit = { yaw: 0.7, pitch: 0.45, dist: 9, target: new THREE.Vector3(0, 0.5, 0) };
+  const orbit = { yaw: 0.7, pitch: 0.62, dist: 11.5, target: new THREE.Vector3(0, 0.5, 0) };
   function updateCamera() {
     camera.aspect = innerWidth / innerHeight;
     camera.updateProjectionMatrix();
