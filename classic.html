@@ -3,18 +3,17 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Slice &amp; Splash GPU — unified particles on WebGPU</title>
+<title>Slice &amp; Splash (classic CPU) — unified particle playground</title>
 <link rel="icon" href="data:," />
 <style>
   * { margin: 0; box-sizing: border-box; }
-  html, body { height: 100%; }
   body { overflow: hidden; font-family: system-ui, sans-serif; background: #10141c; }
-  #view { width: 100%; height: 100%; display: block; touch-action: none; }
+  canvas { display: block; }
   #ui {
     position: fixed; top: 16px; left: 16px; padding: 14px 16px;
     background: rgba(16, 20, 28, 0.72); backdrop-filter: blur(10px);
     border: 1px solid rgba(255,255,255,0.08); border-radius: 14px;
-    color: #dfe6f0; user-select: none; max-width: 300px;
+    color: #dfe6f0; user-select: none; max-width: 280px;
   }
   #ui h1 { font-size: 15px; font-weight: 650; margin-bottom: 2px; }
   #ui .sub { font-size: 11px; color: #8a96a8; margin-bottom: 10px; }
@@ -34,25 +33,17 @@
   #hint { font-size: 11.5px; color: #9fb0c8; line-height: 1.45; min-height: 32px; }
   #stats {
     position: fixed; bottom: 12px; right: 14px; font: 11px ui-monospace, monospace;
-    color: #6e7d92; user-select: none; text-align: right;
+    color: #6e7d92; user-select: none;
   }
-  #gpu-name { font-size: 10px; color: #5a6878; }
-  #loading {
-    position: fixed; inset: 0; display: grid; place-items: center;
-    color: #9fb0c8; font-size: 14px; background: #10141c; text-align: center; line-height: 2;
-  }
-  a { color: #7ab3ff; }
 </style>
 </head>
 <body>
-  <canvas id="view"></canvas>
   <div id="ui">
-    <h1>Slice &amp; Splash <span style="color:#76b900">GPU</span></h1>
-    <div class="sub">unified XPBD particles on WebGPU compute · <span id="gpu-name"></span><br>
-      <a href="classic.html">classic CPU version</a></div>
+    <h1>Slice &amp; Splash</h1>
+    <div class="sub">unified XPBD particles — soft body · slicing · fluid</div>
     <div class="row">
       <button data-tool="grab">🖐 Grab<kbd>1</kbd></button>
-      <button data-tool="slice">🔪 Slice<kbd>2</kbd></button>
+      <button data-tool="knife">🔪 Slice<kbd>2</kbd></button>
       <button data-tool="hose">🚿 Hose<kbd>3</kbd></button>
     </div>
     <div class="row">
@@ -62,7 +53,6 @@
     <div id="hint"></div>
   </div>
   <div id="stats"></div>
-  <div id="loading">initializing WebGPU…</div>
   <script type="importmap">
   {
     "imports": {
@@ -71,6 +61,6 @@
     }
   }
   </script>
-  <script type="module" src="./src/gpu/main.js"></script>
+  <script type="module" src="./src/main.js"></script>
 </body>
 </html>
