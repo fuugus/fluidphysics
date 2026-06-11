@@ -38,7 +38,7 @@ struct Params {
 
   plasticThreshold: f32,
   plasticRate: f32,
-  breakStrain: f32,
+  tearGap: f32,         // bond rips when the gap exceeds this many diameters
   maxSpeed: f32,
 
   wallX: f32,
@@ -300,8 +300,9 @@ fn solidSolve(@builtin(global_invocation_id) g: vec3u) {
     let dd = pi - pos[other].xyz;
     let d = length(dd);
     if (d < 1e-9) { continue; }
-    // tear on overstretch (both endpoints compute the same verdict)
-    if (d > rest * P.breakStrain) { cons[ci].w = 0u; continue; }
+    // ripping: bond breaks when the gap opens past tearGap diameters,
+    // regardless of rest length (also cleans up strands the slicer missed)
+    if (d > rest + P.tearGap * 2.0 * P.solidRadius) { cons[ci].w = 0u; continue; }
     let wo = effInvMass(other);
     let wsum = wi + wo;
     if (wsum == 0.0) { continue; }
