@@ -81,6 +81,9 @@ async function init() {
   const renderer = new Renderer(device, canvas, sim);
 
   function rebuild() {
+    recording = null;
+    recordingPending = false;
+    replaying = null;
     ui.dim = +$('s-dim').value;
     ui.fluidExp = +$('s-fluid').value;
     ui.sizeMm = +$('s-size').value;
@@ -223,10 +226,12 @@ async function init() {
     const p = ro.clone().addScaledVector(rd, hit.t);
     lastGrabPoint = p.clone();
     sim.grabAt([p.x, p.y, p.z], 0.45);
+    recAction({ grab: [p.x, p.y, p.z, 0.45] });
     canvas.style.cursor = 'grabbing';
   }
 
   canvas.addEventListener('pointerdown', (e) => {
+    if (replaying) return; // inputs come from the recorded action log
     if (e.button === 1) { e.preventDefault(); orbiting = { x: e.clientX, y: e.clientY }; return; }
     if (e.button === 2) { startGrab(e, 2); return; } // right = grab
     if (e.button !== 0) return;
@@ -243,6 +248,7 @@ async function init() {
   });
 
   canvas.addEventListener('pointermove', (e) => {
+    if (replaying) return;
     if (orbiting) {
       orbit.yaw -= (e.clientX - orbiting.x) * 0.005;
       orbit.pitch = Math.min(1.45, Math.max(0.05, orbit.pitch + (e.clientY - orbiting.y) * 0.005));
@@ -268,6 +274,8 @@ async function init() {
     } else if (pointerDown && prevRayDir) {
       sim.queueCut([ro.x, ro.y, ro.z],
         [prevRayDir.x, prevRayDir.y, prevRayDir.z], [rd.x, rd.y, rd.z]);
+      recAction({ cut: [[ro.x, ro.y, ro.z],
+        [prevRayDir.x, prevRayDir.y, prevRayDir.z], [rd.x, rd.y, rd.z]] });
       prevRayDir.copy(rd);
       swipePts.push({ x: e.clientX, y: e.clientY, t: performance.now() });
     }
@@ -275,10 +283,11 @@ async function init() {
 
   let orbiting = null;
   addEventListener('pointerup', (e) => {
+    if (replaying) return;
     if (e.button === 1) { orbiting = null; return; }
     if (e.button === grabButton) {
       grabButton = null;
-      if (lastGrabPoint) { sim.release(); lastGrabPoint = null; }
+      if (lastGrabPoint) { sim.release(); recAction({ rel: 1 }); lastGrabPoint = null; }
       canvas.style.cursor = 'crosshair';
     }
     if (e.button === 0) {
@@ -294,24 +303,84 @@ async function init() {
     e.preventDefault();
   }, { passive: false });
 
-  let snapBusy = false;
-  async function saveSnapshot() {
-    if (snapBusy) return;
-    snapBusy = true;
-    const snap = await sim.snapshot();
-    const blob = new Blob([JSON.stringify(snap)], { type: 'application/json' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `splash-snapshot-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
-    a.click();
-    URL.revokeObjectURL(a.href);
-    snapBusy = false;
+  // ---- action recording: hold Space = record (snapshot at press, then the
+  // input log); release = download. Replay = loadSnapshot + re-feed the log
+  // at the same frame indices — the sim steps a fixed 1/60 per frame, so
+  // the rerun is deterministic on the same GPU. ----
+  let simFrame = 0;
+  let recording = null;
+  let recordingPending = false;
+  let replaying = null;
+
+  function recAction(obj) {
+    if (recording) recording.actions.push({ f: simFrame - recording.frame0, ...obj });
+  }
+
+  function captureFrame() {
+    if (!recording) return;
+    const f = simFrame - recording.frame0;
+    const pend = sim.pending;
+    const gd = pend.grabDelta;
+    if (gd[0] || gd[1] || gd[2]) recording.actions.push({ f, gd: [...gd] });
+    if (pend.emitCount > 0) {
+      recording.actions.push({ f, emit: [pend.emitCount,
+        pend.emitPos[0], pend.emitPos[1], pend.emitPos[2],
+        pend.emitDir[0], pend.emitDir[1], pend.emitDir[2],
+        pend.emitSide[0], pend.emitSide[1], pend.emitSide[2],
+        pend.emitUp[0], pend.emitUp[1], pend.emitUp[2],
+        pend.emitPos[3], pend.emitDir[3]] });
+    }
+    const cam = [orbit.yaw, orbit.pitch, orbit.dist];
+    if (!recording.lastCam || cam.some((v, k) => v !== recording.lastCam[k])) {
+      recording.actions.push({ f, cam });
+      recording.lastCam = cam;
+    }
+  }
+
+  function applyReplay() {
+    const r = replaying;
+    while (r.idx < r.actions.length && r.actions[r.idx].f <= r.frame) {
+      const a = r.actions[r.idx++];
+      if (a.grab) sim.grabAt(a.grab.slice(0, 3), a.grab[3]);
+      if (a.rel) sim.release();
+      if (a.cut) sim.queueCut(a.cut[0], a.cut[1], a.cut[2]);
+      if (a.gd) sim.pending.grabDelta = [...a.gd];
+      if (a.emit) {
+        const e = a.emit;
+        sim.emit(e[0], e.slice(1, 4), e.slice(4, 7), e.slice(7, 10), e.slice(10, 13), e[13], e[14]);
+      }
+      if (a.cam) { orbit.yaw = a.cam[0]; orbit.pitch = a.cam[1]; orbit.dist = a.cam[2]; updateCamera(); }
+    }
+    r.frame++;
+    if (r.idx >= r.actions.length && r.frame > r.lastF + 120) {
+      replaying = null;
+      console.log('replay finished');
+    }
   }
 
   addEventListener('keydown', (e) => {
     if (e.key === 'r' || e.key === 'R') sim.resetSolid();
     if (e.key === 'c' || e.key === 'C') sim.clearFluid();
-    if (e.code === 'Space') { e.preventDefault(); saveSnapshot(); }
+    if (e.code === 'Space') {
+      e.preventDefault();
+      if (!e.repeat && !recording && !recordingPending && !replaying) recordingPending = true;
+    }
+  });
+  addEventListener('keyup', async (e) => {
+    if (e.code !== 'Space') return;
+    recordingPending = false;
+    if (!recording) return;
+    const rec = recording;
+    recording = null;
+    const snap = await rec.snapPromise;
+    const bundle = { version: 1, type: 'splash-recording', snapshot: snap, actions: rec.actions };
+    const blob = new Blob([JSON.stringify(bundle)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `splash-recording-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    console.log(`recording saved: ${rec.actions.length} actions over ${simFrame - rec.frame0} frames`);
   });
   $('reset').addEventListener('click', () => sim.resetSolid());
   $('drain').addEventListener('click', () => sim.clearFluid());
@@ -343,7 +412,9 @@ async function init() {
     const dt = Math.min((now - last) / 1000, 0.05);
     last = now;
     if (!paused) {
+      if (replaying) applyReplay();
       sprayStep();
+      captureFrame();
       const enc = device.createCommandEncoder();
       sim.encode(enc, ts);
       renderer.render(enc, camera, lightDir, ts);
@@ -352,6 +423,11 @@ async function init() {
         enc.copyBufferToBuffer(ts.resolve, 0, ts.staging, 0, 32);
       }
       device.queue.submit([enc.finish()]);
+      if (recordingPending && !replaying) {
+        recordingPending = false;
+        recording = { frame0: simFrame + 1, actions: [], snapPromise: sim.snapshot(), lastCam: null };
+      }
+      simFrame++;
       if (ts && !ts.busy) {
         ts.busy = true;
         ts.staging.mapAsync(GPUMapMode.READ).then(() => {
@@ -381,7 +457,17 @@ async function init() {
   // ---- test/tuning hooks ----
   window.__sim = {
     sim, renderer, camera,
-    // load a Space-key snapshot file's parsed JSON for exact-state repro
+    // play back a Space-hold recording bundle (snapshot + action log)
+    replay(bundle) {
+      this.loadSnapshot(bundle.snapshot || bundle);
+      const actions = bundle.actions || [];
+      replaying = {
+        actions, idx: 0, frame: 0,
+        lastF: actions.length ? actions[actions.length - 1].f : 0,
+      };
+    },
+    isReplaying: () => !!replaying,
+    // load a snapshot file's parsed JSON for exact-state repro
     loadSnapshot(snap) {
       pointerDown = false;
       spraying = false;

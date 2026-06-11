@@ -130,7 +130,7 @@ fn integrate(@builtin(global_invocation_id) g: vec3u) {
       vel[i] = vec4f(v, 0.0);
       return;
     }
-    var corr = (t - np) * P.grabK;
+    var corr = (t - np) * (P.grabK * density[i].y); // density.y = grip weight
     let cl = length(corr);
     let maxC = 0.05; // caps follow speed (~20 m/s) — whip-fast but not teleport
     if (cl > maxC) { corr *= maxC / cl; }
@@ -639,13 +639,18 @@ fn grabSelect(@builtin(global_invocation_id) g: vec3u) {
   let i = g.x;
   if (i >= SOLID_N || (flags[i] & F_ACTIVE) == 0u) { return; }
   let dd = pos[i].xyz - P.grabC.xyz;
-  if (dot(dd, dd) < P.grabC.w * P.grabC.w) {
+  let q2 = dot(dd, dd) / (P.grabC.w * P.grabC.w);
+  if (q2 < 1.0) {
     flags[i] |= F_GRABBED;
+    // grip strength falls off from the grab center to the sphere edge:
+    // a firm core with an elastic skirt, so the grabbed region deforms
+    // naturally instead of moving as a rigid plug
+    let w = (1.0 - q2) * (1.0 - q2) * 0.95 + 0.05;
     // initialize the spring target at the particle's current position
     let p = pos[i].xyz;
     prev[i] = vec4f(prev[i].xyz, p.x);
     vel[i] = vec4f(vel[i].xyz, p.y);
-    density[i] = vec2f(p.z, density[i].y);
+    density[i] = vec2f(p.z, w);
   }
 }
 
