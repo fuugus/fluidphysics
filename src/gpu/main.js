@@ -13,7 +13,7 @@ async function init() {
     requiredFeatures: hasTs ? ['timestamp-query'] : [],
     requiredLimits: { maxStorageBuffersPerShaderStage: 10 },
   });
-  const VERSION = 'v0.2-tets';
+  const VERSION = 'v0.3-voxels';
   const info = adapter.info || {};
   $('gpu-name').textContent = `${VERSION} · ${info.vendor || 'gpu'} ${info.architecture || ''}`.trim();
   device.addEventListener('uncapturederror', (e) => {
@@ -25,43 +25,64 @@ async function init() {
   // initial scale knobs: ?fluid=262144&dim=24&emit=120&size=40 (radius in mm)
   const q = new URLSearchParams(location.search);
 
-  // one particle radius drives both body and water (for now); everything
-  // length-dependent in the solver is derived from it
-  function deriveOpts(dim, maxFluid, radiusMm) {
+  // one radius drives both the voxel balls and the water; everything
+  // length-dependent in the solver is derived from it. Bodies are disphenoid
+  // voxels: ball radius = BALL_FRAC * a (lattice unit a; short line a*sqrt(3),
+  // long 2a). Voxels sharing no vertex sit >= 2a apart, so any BALL_FRAC < 1
+  // keeps an intact body free of internal contacts; 0.6 overlaps neighbouring
+  // balls enough that water can't nestle into the pockets around vertices.
+  const BALL_FRAC = +(q.get('ball') ?? 0.6);
+  function deriveOpts(cells, maxFluid, radiusMm) {
     const r = radiusMm / 1000;
     const H = 2.6 * r;
-    const spacing = 1.91 * r;
+    const a = r / BALL_FRAC;
+    // MPM water: grid cell ~2.7 ball radii, water particles dx/2 apart
+    // (8 per cell); the emitter spaces them 2.2 fluid radii apart
+    const mpmDx = 2.67 * r;
+    const rf = mpmDx / 4.4;
+    const cells2 = Math.max(2, Math.round(cells / Math.cbrt(20)));
+    const voxels = 12 * cells ** 2 * (cells + 1) + 12 * cells2 ** 2 * (cells2 + 1);
     return {
-      SOLID_DIM: dim,
+      SOLID_DIM: cells,
+      SOLID_DIM2: cells2,
       MAX_FLUID: maxFluid,
-      TABLE: Math.max(1 << 18, 1 << Math.ceil(Math.log2(2 * (maxFluid + dim ** 3)))),
+      TABLE: Math.max(1 << 18, 1 << Math.ceil(Math.log2(2 * (maxFluid + voxels)))),
       // smaller particles need more substeps: per-substep penetration is an
       // absolute distance, so the same impact means more strain at small scale
       substeps: Math.min(10, Math.max(5, Math.round(0.2 / r))),
-      spacing,
-      solidMass: 100 * r ** 3,   // ~8x fluid density, matches original feel
-      fluidMass: 12 * r ** 3,
-      cubeCenter: [0, (dim - 1) * spacing / 2 + 0.5, 0],
+      spacing: a,
+      // same bulk density as the cubic version (~8x water): a BCC vertex owns 4a^3
+      solidMass: 57.4 * a ** 3,
+      fluidMass: 1.8 * (mpmDx / 2) ** 3,  // ~1/8 of the jelly's density
+      mpm: {
+        dx: mpmDx,
+        ...(q.get('goo') && { viscosity: +q.get('goo') }),
+        ...(q.get('bulk') && { bulk: +q.get('bulk') }),
+      },
+      cubeCenter: [0, cells * a + 0.5, 0],
       params: {
         solidRadius: r,
-        fluidRadius: r,
-        fluidH: H,
+        fluidRadius: rf,
+        fluidH: 2.6 * rf,    // (render splat size; MPM does the water physics)
         cellSize: H,
         stiffness: 0.0015 * (H / 0.13),     // pressure displacement scales with H
         nearStiffness: 0.006 * (H / 0.13),
+        ...(q.get('long') && { longInfluence: +q.get('long') }),
+        ...(q.get('share') && { contactShare: +q.get('share') }),
+        ...(q.get('comp') && { compliance: +q.get('comp') }),
       },
     };
   }
 
   // ---- UI sliders ----
   const ui = {
-    dim: Math.min(32, parseInt(q.get('dim')) || 20),
+    dim: Math.min(20, Math.max(3, parseInt(q.get('dim')) || 11)),
     fluidExp: Math.round(Math.log2(Math.min(1 << 20, parseInt(q.get('fluid')) || 65536))),
     sizeMm: Math.min(80, Math.max(20, parseInt(q.get('size')) || 30)),
-    emit: Math.min(256, parseInt(q.get('emit')) || 28),
+    emit: Math.min(256, parseInt(q.get('emit')) || 96),
   };
   const fmt = {
-    dim: (v) => `${v}³ = ${(v ** 3).toLocaleString()}`,
+    dim: (v) => `${v}³ cells = ${(12 * v * v * (v + 1)).toLocaleString()} voxels`,
     fluid: (v) => (1 << v).toLocaleString(),
     size: (v) => `${v} mm`,
     emit: (v) => `${v}/frame`,
@@ -103,6 +124,29 @@ async function init() {
     $(id).addEventListener('change', rebuild);
   }
   $('s-emit').addEventListener('input', () => { updateLabels(); ui.emit = +$('s-emit').value; });
+
+  // ---- render mode (surface skinning) ----
+  let renderMode = q.get('mode') || 'spheres';
+  let skinIso = +$('s-iso').value;
+  let texMode = +(q.get('tex') || 0);
+  const modeButtons = [...document.querySelectorAll('#modes button, #modes2 button, #modes3 button, #modes4 button')];
+  const texButtons = [...document.querySelectorAll('#tex button')];
+  const updateIsoLabel = () => { $('v-iso').textContent = skinIso.toFixed(1); };
+  const applyMode = (m) => {
+    renderMode = m;
+    for (const b of modeButtons) b.classList.toggle('on', b.dataset.mode === m);
+    $('iso-row').style.display = (m === 'spheres' || m === 'ssfr' || m === 'tetra') ? 'none' : 'grid';
+  };
+  const applyTex = (t) => {
+    texMode = t;
+    for (const b of texButtons) b.classList.toggle('on', +b.dataset.tex === t);
+  };
+  for (const b of modeButtons) b.addEventListener('click', () => applyMode(b.dataset.mode));
+  for (const b of texButtons) b.addEventListener('click', () => applyTex(+b.dataset.tex));
+  $('s-iso').addEventListener('input', () => { skinIso = +$('s-iso').value; updateIsoLabel(); });
+  updateIsoLabel();
+  applyMode(renderMode);
+  applyTex(texMode);
 
   // ---- timestamps ----
   let ts = null;
@@ -226,9 +270,8 @@ async function init() {
     grabDepth = hit.t;
     const p = ro.clone().addScaledVector(rd, hit.t);
     lastGrabPoint = p.clone();
-    const lattice = hit.id < sim.N1 ? 0 : 1;
-    sim.grabAt([p.x, p.y, p.z], 0.45, lattice);
-    recAction({ grab: [p.x, p.y, p.z, 0.45, lattice] });
+    sim.grabAt([p.x, p.y, p.z], 0.45, hit.body);
+    recAction({ grab: [p.x, p.y, p.z, 0.45, hit.body] });
     canvas.style.cursor = 'grabbing';
   }
 
@@ -466,7 +509,7 @@ async function init() {
       captureFrame();
       const enc = device.createCommandEncoder();
       sim.encode(enc, ts);
-      renderer.render(enc, camera, lightDir, ts);
+      renderer.render(enc, camera, lightDir, ts, renderMode, skinIso, texMode);
       if (ts) enc.resolveQuerySet(ts.set, 0, 4, ts.resolve, 0);
       if (ts && !ts.busy) {
         enc.copyBufferToBuffer(ts.resolve, 0, ts.staging, 0, 32);
@@ -496,7 +539,7 @@ async function init() {
       frames = 0; fpsT = 0;
       sim.readActiveCount().then((n) => {
         $('stats').textContent =
-          `${fps} fps · ${sim.SOLID_N.toLocaleString()} body + ${n.toLocaleString()} water` +
+          `${fps} fps · ${sim.VOX_N.toLocaleString()} voxels (${sim.VERT_N.toLocaleString()} vertices) + ${n.toLocaleString()} water` +
           (ts ? ` · sim ${ts.compute.toFixed(1)}ms · draw ${ts.render.toFixed(1)}ms` : '');
       }).catch(() => {}); // staging buffer may be destroyed by a rebuild mid-read
     }
@@ -518,9 +561,8 @@ async function init() {
     isReplaying: () => !!replaying,
     // load a snapshot file's parsed JSON for exact-state repro
     loadSnapshot(snap, keepGrabs = false) {
-      // snapshots from before the second cube have no SOLID_DIM2 — their
-      // buffers are laid out without it, so replay them without one
-      if (snap.opts.SOLID_DIM2 === undefined) snap.opts.SOLID_DIM2 = 0;
+      if (snap.app !== 'slice-splash-voxels')
+        throw new Error('this recording is from the cubic-lattice version (main branch)');
       pointerDown = false;
       spraying = false;
       lastGrabPoint = null;
@@ -533,17 +575,25 @@ async function init() {
       $('s-dim').value = snap.opts.SOLID_DIM;
       $('s-fluid').value = Math.round(Math.log2(snap.opts.MAX_FLUID));
       $('s-size').value = Math.round(snap.opts.params.solidRadius * 1000);
+      ui.dim = snap.opts.SOLID_DIM; ui.fluidExp = +$('s-fluid').value; ui.sizeMm = +$('s-size').value;
       updateLabels();
       window.__sim.sim = sim;
     },
     pause: (v) => { paused = v; },
+    // the voxel list: [{ verts, alive, color, body, pos, vel, quat, angVel }]
+    voxels: () => sim.readVoxels(),
+    skinSample: () => renderer.skin.debugReadColor(),
+    skinPNG: () => renderer.skin.debugReadPNG(),
+    screenPNG: () => renderer.capture(),
     setParam: (k, v) => { sim.o.params[k] = v; },
     spray: (on) => { spraying = on; hoseTarget.set(1.5, 0, 1.5); },
     async metrics() {
       const { pos, vel, flags } = await sim.readState();
-      const N = sim.SOLID_N, T = sim.TOTAL;
-      let sMinY = 1e9, sMaxY = -1e9, sBad = 0, sAvgSp = 0;
-      for (let i = 0; i < N; i++) {
+      const N = sim.FLUID0, T = sim.TOTAL;
+      let sMinY = 1e9, sMaxY = -1e9, sBad = 0, sAvgSp = 0, sN = 0;
+      for (let i = sim.BALL0; i < N; i++) { // voxel balls (velocities: per frame)
+        if ((flags[i] & 1) === 0) continue;
+        sN++;
         const y = pos[i * 4 + 1];
         if (!isFinite(y)) { sBad++; continue; }
         sMinY = Math.min(sMinY, y); sMaxY = Math.max(sMaxY, y);
@@ -560,7 +610,7 @@ async function init() {
         fAvgSp += Math.hypot(vel[i * 4], vel[i * 4 + 1], vel[i * 4 + 2]);
       }
       return {
-        solid: { minY: sMinY, maxY: sMaxY, bad: sBad, avgSpeed: sAvgSp / N },
+        solid: { voxels: sN, minY: sMinY, maxY: sMaxY, bad: sBad, avgSpeed: sAvgSp / Math.max(1, sN) },
         fluid: { n: fN, bad: fBad, maxY: fMaxY, pooledPct: fN ? Math.round(100 * fBelow / fN) : 0, avgSpeed: fN ? fAvgSp / fN : 0 },
         gpu: ts ? { compute: ts.compute, render: ts.render } : null,
       };

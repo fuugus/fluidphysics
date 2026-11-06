@@ -27,6 +27,9 @@
   button:hover { background: rgba(255,255,255,0.12); }
   button.on { background: #2f6fed; border-color: #2f6fed; color: #fff; }
   button.small { flex: initial; font-size: 11.5px; padding: 6px 10px; }
+  .seg-label { font-size: 10px; color: #5a6878; text-transform: uppercase;
+    letter-spacing: .06em; margin: 4px 0 6px; }
+  #modes2, #modes3, #modes4 { margin-top: -4px; }
   kbd {
     font: 10px ui-monospace, monospace; background: rgba(255,255,255,0.1);
     border-radius: 4px; padding: 1px 4px; margin-left: 4px;
@@ -58,15 +61,42 @@
   <canvas id="view"></canvas>
   <div id="ui">
     <h1>Slice &amp; Splash <span style="color:#76b900">GPU</span></h1>
-    <div class="sub">unified XPBD particles on WebGPU compute · <span id="gpu-name"></span><br>
+    <div class="sub">disphenoid voxels + unified XPBD particles on WebGPU · <span id="gpu-name"></span><br>
       <a href="classic.html">classic CPU version</a></div>
     <div class="row">
       <button id="reset" class="small">↺ New cube<kbd>R</kbd></button>
       <button id="drain" class="small">🕳 Drain water<kbd>C</kbd></button>
     </div>
+    <div class="seg-label">surface</div>
+    <div class="row" id="modes">
+      <button data-mode="spheres" class="on">⚪ Spheres</button>
+      <button data-mode="ssfr">💧 SSFR</button>
+      <button data-mode="tetra">🔺 Tetravoxels</button>
+    </div>
+    <div class="row" id="modes2">
+      <button data-mode="mc">🫧 Metaballs</button>
+      <button data-mode="raymarch">🔮 Raymarch</button>
+    </div>
+    <div class="row" id="modes3">
+      <button data-mode="raymarchHQ">✨ Raymarch+ <span style="opacity:.6">2× SSAA</span></button>
+    </div>
+    <div class="row" id="modes4">
+      <button data-mode="embed">📦 Embedded mesh <span style="opacity:.6">textured</span></button>
+    </div>
+    <div class="seg-label">texture</div>
+    <div class="row" id="tex">
+      <button data-tex="0" class="on">None</button>
+      <button data-tex="1">🧱 Triplanar</button>
+      <button data-tex="2">🩹 Material</button>
+    </div>
+    <div class="sliders" id="iso-row" style="display:none">
+      <label>surface level <span class="val" id="v-iso"></span>
+        <input type="range" id="s-iso" min="0.2" max="6" step="0.1" value="1.5"></label>
+      <small>lower = puffier blobs · higher = tighter skin</small>
+    </div>
     <div class="sliders">
       <label>body <span class="val" id="v-dim"></span>
-        <input type="range" id="s-dim" min="8" max="32" step="1"></label>
+        <input type="range" id="s-dim" min="3" max="20" step="1"></label>
       <label>water max <span class="val" id="v-fluid"></span>
         <input type="range" id="s-fluid" min="14" max="20" step="1"></label>
       <label>particle size <span class="val" id="v-size"></span>
